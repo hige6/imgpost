@@ -1,7 +1,7 @@
 {
   "name": "imgpost",
   "version": "0.1.0",
-  "description": "图邮 (imgpost): send local/URL images into DSH conversations and generate images via OpenAI-compatible APIs, rendered inline via a local /dsh-img2 route.",
+  "description": "图邮 (imgpost)：让你的 DSH 能发图给你 —— 本地图片、网页图片、AI 生图，一键发进对话里。",
   "type": "module",
   "main": "src/host.js",
   "exports": {

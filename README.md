@@ -1,6 +1,6 @@
 # 图邮 imgpost
 
-> 把图片送进 DSH 对话里 —— 本地文件、网页图片、生图 API，一条链路全搞定。
+> **让你的 DSH 能发图给你** —— 本地图片、网页图片、AI 生图，一键发进对话里。
 
 **imgpost** 是一个 [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness) / Cordis 插件，提供两个模型工具：
 
