@@ -19,7 +19,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/<your-github-username>/imgpost.git"
+    "url": "git+https://github.com/hige6/imgpost.git"
   },
   "publishConfig": {
     "access": "public"
