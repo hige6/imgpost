@@ -1,0 +1,27 @@
+{
+  "name": "imgpost",
+  "version": "0.1.0",
+  "description": "图邮 (imgpost): send local/URL images into DSH conversations and generate images via OpenAI-compatible APIs, rendered inline via a local /dsh-img2 route.",
+  "type": "module",
+  "main": "src/host.js",
+  "files": [
+    "src"
+  ],
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "plugin",
+    "image",
+    "image-generation",
+    "chat"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/<your-github-username>/imgpost.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
