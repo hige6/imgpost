@@ -4,9 +4,18 @@
   "description": "图邮 (imgpost): send local/URL images into DSH conversations and generate images via OpenAI-compatible APIs, rendered inline via a local /dsh-img2 route.",
   "type": "module",
   "main": "src/host.js",
+  "exports": {
+    ".": "./src/host.js"
+  },
   "files": [
-    "src"
+    "src",
+    "README.md",
+    "LICENSE"
   ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18.17"
+  },
   "keywords": [
     "dsh",
     "deepseek-harness",
@@ -20,6 +29,13 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/hige6/imgpost.git"
+  },
+  "bugs": {
+    "url": "https://github.com/hige6/imgpost/issues"
+  },
+  "homepage": "https://github.com/hige6/imgpost#readme",
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
   },
   "publishConfig": {
     "access": "public"
