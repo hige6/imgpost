@@ -1,7 +1,7 @@
 {
   "name": "imgpost",
   "version": "0.1.0",
-  "description": "图邮 (imgpost)：让你的 DSH 能发图给你 —— 本地图片、网页图片、AI 生图，一键发进对话里。",
+  "description": "图邮 (imgpost)：让你的 DSH 能发图、会看图 —— 本地图片、网页图片、AI 生图 + 识图（一只眼睛），一键发进对话里。",
   "type": "module",
   "main": "src/host.js",
   "exports": {
@@ -23,6 +23,9 @@
     "plugin",
     "image",
     "image-generation",
+    "image-recognition",
+    "vision",
+    "ocr",
     "chat"
   ],
   "license": "MIT",
