@@ -1,105 +1,82 @@
-# 图邮 imgpost
+# imgpost（图邮）
 
-> **让你的 DSH 能发图给你** —— 本地图片、网页图片、AI 生图，一键发进对话里。
+让你的 **DeepSeek Harness（DSH / Cordis）** 能在对话里配图 —— 发本地图、网页图、AI 生图，还能**看图（识图）**。零依赖，一个插件全搞定。
 
-**imgpost** 是一个 [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness) / Cordis 插件，提供两个模型工具：
+DSH 的 agent 原本只能发文字；装上 imgpost 之后，它就能把图片直接送进聊天里给你看，也能"睁眼"读懂图片里的内容。
 
-| 工具 | 作用 |
-|---|---|
-| `send_image` | 把 **http(s) URL / base64 data URI / 本地文件路径** 的图片送入对话，持久化到附件库并内联渲染 |
-| `generate_image` | 调用 **任意 OpenAI 兼容的 `/images/generations` 生图接口**，生成图片后直接发进对话 |
+## ✨ 它能做什么（三大能力 + 一只眼睛）
 
-## 为什么需要它
+| 能力 | 工具名 | 说明 |
+|---|---|---|
+| 🖼️ 发图 | `send_image` | 把本地文件 / 网页 URL / base64 图片发进对话，作为持久附件展示 |
+| 🎨 生图 | `generate_image` | 调用任意 OpenAI 兼容的 `/images/generations` 接口生图并直接发给你 |
+| 👁️ **识图（看图/眼睛）** | `imgpost_read_image` | 用外部视觉 API **读懂**图片里的内容 —— 文字 OCR、场景、排版、任意指定问题都能答，结果按图片指纹磁盘缓存，重启不重读 |
+| 🔗 透明通道 | vision provider wrap | 自动给不带视觉的文本模型包一层 `imgpost-<上游>` 通道，粘贴的图片会自动转换成描述文本，让任何模型都能"看见" |
 
-- Markdown 只支持渲染 **http(s) 绝对 URL** 的图片——本地文件路径（`E:\...\a.jpg`）浏览器出于安全限制无法直接显示。
-- imgpost 把图片字节**落盘到 DSH 附件库**（`~/.dsh/attachments/`），再通过同源的 `/dsh-img2/<sha256>` HTTP 路由供浏览器拉取，URL 永久有效。
-- 生图 API 的返回（`data[].url` 或 `data[].b64_json`）也会被自动下载、落盘、转成稳定 URL。
+图片都存成 durable attachment，并通过同源的 `/dsh-img2/<sha256>` 路由回显。
 
-## 安装
+## 🚀 安装
 
-把插件目录挂到 DSH 的 profile 组合层。以 web profile 为例：
+### 方式一：从 npm 装（发布到 npm 后）
 
 ```bash
-# 1. 把本仓库克隆/复制到 ~/.dsh/plugins/imgpost
-# 2. 在 profile 的 package.json 里加入依赖
-cd ~/.dsh/profiles/web
-# package.json dependencies: { "imgpost": "link:../../plugins/imgpost" }
-pnpm install --ignore-scripts
-
-# 3. 在 cordis.patch.yml 的 - insert: 列表里加入插件行
-# - id: imgpost
-#   name: '../../plugins/imgpost/src/host.js'
+npm install imgpost
 ```
 
-重启 DSH 后，`send_image` 和 `generate_image` 会出现在模型工具清单里。
+### 方式二：从 GitHub 拉（推荐）
 
-> 注意：`name` 必须指向插件的**入口文件**（`src/host.js`），不能是目录——DSH 的 loader 不支持 ESM 目录导入。
+```bash
+git clone https://github.com/hige6/imgpost.git
+```
 
-## 生图配置
+把 `src/host.js` 所在目录放到 DSH 的插件目录（如 `~/.dsh/plugins/imgpost`），并在配置里加载它（见下方"加载到 DSH"）。
 
-二选一：
+### 加载到 DSH
 
-**方式一：配置文件 `~/.dsh/image-sender.json`**（推荐）
+DSH 通过 Cordis 插件机制加载（本插件是一个宿主端 host 插件）。在你的 DSH 配置（`cordis.patch.yml` / profiles 的补丁文件）里加一行即可，例如：
 
-```json
+```yaml
+- id: imgpost
+  name: '../../plugins/imgpost/src/host.js'
+```
+
+启动 DSH 后，agent 会自动获得 `send_image` / `generate_image` / `imgpost_read_image` 三个工具。
+
+> DSH 是什么？[DeepSeek Harness](https://github.com/deepseek-ai/dsh) —— 一个基于 Cordis 的可编程 AI 智能体工作台。imgpost 就是为它写的一个能力插件。
+
+## ⚙️ 配置（全部可选，**默认不绑定任何具体厂商**）
+
+不配也能用 `send_image`（发本地图/网页图）；生图和识图需要凭据，但不限厂商、逢我们只读你显式给的配置。
+
+### 生图：任一
+```
+环境变量：DSH_IMAGE_API_KEY / DSH_IMAGE_API_BASE / DSH_IMAGE_API_MODEL
+或文件：   ~/.dsh/image-sender.json  { "apiKey", "baseURL", "model" }
+```
+
+### 识图：任一
+```
+文件：     ~/.dsh/vision-sender.json
+样式：
 {
-  "apiKey": "sk-xxxx",
-  "baseURL": "https://api.siliconflow.cn/v1",
-  "model": "black-forest-labs/FLUX.1-schnell"
+  "primary":  { "baseURL": "...", "apiKey": "...", "model": "...", "format": "openai|anthropic" },
+  "fallback": { "baseURL": "...", "apiKey": "...", "model": "...", "format": "openai|anthropic" }
 }
+环境变量：DSH_VISION_API_KEY / DSH_VISION_API_BASE / DSH_VISION_API_MODEL
 ```
 
-**方式二：环境变量**
+> `format` 支持 `openai`（OpenAI 兼容 `/chat/completions`）和 `anthropic`（`/messages`）两种风格，兼容大多数视觉服务。
 
-```
-DSH_IMAGE_API_KEY=sk-xxx
-DSH_IMAGE_API_BASE=https://api.xxx.com/v1
-DSH_IMAGE_API_MODEL=model-name
-```
+### （可选）对外图片基址
+想在 LAN / Tailscale 等让手机或别的设备也看到图片，配置 `publicBaseUrl`（插件加载时传入），否则自动探测 GUI 端口。
 
-优先级：环境变量 > 配置文件。生图时也可用 `model` 参数临时覆盖。
+## 🧩 技术要点
+- **零依赖**：核心逻辑直接用宿主端 Service（`attachments` / `fs` / `subprocess` / `webServer` / `tools` / `llm`），不引入第三方包。
+- **磁盘证据缓存**：识图结果按图片 SHA-256 缓存在 `~/.dsh/imgpost-vision-cache/`，同一张图只描述一次，跨重启不重读。
+- **跨电脑通用**：没有写死的本机路径 / 盘符 / 端口 / 厂商模型名，克隆即用。
 
-### 兼容的服务商
+## 📄 License
+MIT
 
-只要端点形如 `POST {baseURL}/images/generations` 且返回 `data[].url` 或 `data[].b64_json` 即可：
-
-| 服务商 | baseURL | 模型示例 |
-|---|---|---|
-| Agnes AI | `https://api.agnes-ai.cn/v1` | `agnes-image-2.1-flash` |
-| 智谱 AI | `https://open.bigmodel.cn/api/paas/v4` | `cogview-4` |
-| SiliconFlow | `https://api.siliconflow.cn/v1` | `black-forest-labs/FLUX.1-schnell` |
-| 阿里云百炼 | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `wanx-v1` |
-| OpenAI | `https://api.openai.com/v1` | `gpt-image-1` |
-
-## 使用方法
-
-调用工具成功后，**模型必须在回复里插入 markdown 图片语法**（工具描述和返回结果里都有明确提示）：
-
-```markdown
-![描述](http://127.0.0.1:<port>/dsh-img2/<sha256-hex>)
-```
-
-DSH GUI 的 MarkdownText 组件会把它渲染成内嵌图。
-
-## 工作原理
-
-```
-本地文件 / URL / 生图 API
-        ↓ send_image / generate_image
-        ↓ 读取字节 → attachments.saveImage()
-        ↓ ~/.dsh/attachments/v1/objects/<2-hex>/<64-hex>  (sharp 校验并落盘)
-        ↓ 返回 ImageAttachmentRef
-        ↓ /dsh-img2/<sha256> 路由 (webServer.register) 提供 HTTP 服务
-        ↓ 浏览器同源加载 → markdown 内嵌渲染
-```
-
-端口是**动态探测**的（`webServer.port`，即路由所在 HTTP 服务的真实监听端口），DSH 重启换端口也不会断图。
-
-## 许可证
-
-[MIT](./LICENSE)
-
-## 致谢
-
-- 生图链路支持 Agnes AI、智谱、SiliconFlow 等 OpenAI 兼容服务
-- 基于 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的 Cordis 插件体系开发
+---
+*imgpost —— 让你的 DSH 会发图、更会看图。*
