@@ -31,6 +31,30 @@ git clone https://github.com/hige6/imgpost.git
 
 把 `src/host.js` 所在目录放到 DSH 的插件目录（如 `~/.dsh/plugins/imgpost`），并在配置里加载它（见下方"加载到 DSH"）。
 
+### 🚀 一键安装脚本（Windows / PowerShell）
+
+仓库里带了一个**一键安装脚本** `scripts/install.ps1`：自动探测 DSH 配置 → **备份** `cordis.patch.yml` → 在文件末尾追加 imgpost 配置（不碰你已有内容）→ 校验，失败自动回滚。
+
+```powershell
+# 方式 A：本地 clone 后安装（自动探测 profile）
+powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
+
+# 方式 B：指定 profile
+powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Profile web
+
+# 方式 C：直接通过 npm 安装到 ~/.dsh/plugins 并配置
+powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -FromNpm
+```
+
+脚本做的事：
+1. 找到 `cordis.patch.yml`（`~/.dsh/profiles/*/`，自动排除 node_modules 里的副本）
+2. 若已配置 imgpost → 直接提示跳过，不重复写入
+3. 否则**先备份**，再在文件末尾追加一个独立的 `- insert:` 块
+4. 写入后校验，失败则恢复备份
+5. 提示你重启 DSH
+
+> 想完全手动？看下一节"加载到 DSH"。
+
 ### 加载到 DSH
 
 DSH 通过 Cordis 插件机制加载（本插件是一个宿主端 host 插件）。在你的 DSH 配置（`cordis.patch.yml` / profiles 的补丁文件）里加一行即可，例如：
