@@ -1,15 +1,27 @@
 // imgpost（图邮） — host plugin, zero dependencies.
-// Sends images into DSH conversations (local file / http(s) URL / data URI) and
-// generates images via any OpenAI-compatible /images/generations endpoint.
+// Three image capabilities in DSH conversations:
+//   1. send_image    — ship a local file / http(s) URL / data URI / attachment
+//                      into the chat as a durable /dsh-img2/<sha256> image.
+//   2. generate_image— call any OpenAI-compatible /images/generations endpoint
+//                      and post the result into the chat.
+//   3. read_image    — describe an image through an external vision API
+//                      (OpenAI- or Anthropic-compatible), cached on disk keyed
+//                      by the image digest so a restart never re-reads it.
 // Images are stored as durable attachments and served back through a
-// same-origin /dsh-img2/<sha256> webServer route so the chat can display them.
+// same-origin /dsh-img2/<sha256-hex> webServer route.
 //
-// Config for generation (optional): env DSH_IMAGE_API_KEY / DSH_IMAGE_API_BASE
-// / DSH_IMAGE_API_MODEL, or ~/.dsh/image-sender.json { apiKey, baseURL, model }.
+// Config (all optional, nothing baked in to any particular vendor):
+//   Generation : env DSH_IMAGE_API_KEY / DSH_IMAGE_API_BASE / DSH_IMAGE_API_MODEL
+//                or ~/.dsh/image-sender.json { apiKey, baseURL, model }.
+//   Vision     : ~/.dsh/vision-sender.json { primary, fallback, upstreams }
+//                (each backend { baseURL, apiKey, model, format:'openai'|'anthropic' }),
+//                else env DSH_VISION_API_KEY / DSH_VISION_API_BASE / DSH_VISION_API_MODEL.
+//                Evidence is cached in ~/.dsh/imgpost-vision-cache/<sha256>.json.
 export const name = 'imgpost';
 // Hard dependencies: the loader parks this plugin until these host services are
-// provided, so apply() never races startup order.
-export const inject = ['attachments', 'subprocess', 'fs', 'webServer', 'tools'];
+// provided, so apply() never races startup order. `llm` powers the vision
+// provider wrap (imgpost-<upstream>) that lets pasted images pass admission.
+export const inject = ['attachments', 'subprocess', 'fs', 'webServer', 'tools', 'llm'];
 
 const shellCandidates = [
   'pwsh',
@@ -18,12 +30,18 @@ const shellCandidates = [
   'C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
 ];
 
-export function apply(ctx) {
+export function apply(ctx, config) {
   const attachments = ctx.get('attachments');
   const subprocess = ctx.get('subprocess');
   const fs = ctx.get('fs');
   const webServer = ctx.get('webServer');
   const sandboxPolicy = ctx.get('sandboxPolicy');
+  const llm = ctx.get('llm');
+  // Optional public base URL for served images (e.g. a Tailscale tailnet), falls
+  // back to the runtime-probed web origin (webServer.port → DSH_WEB_URL → default).
+  const publicOrigin = (config && typeof config.publicBaseUrl === 'string' && /^https?:\/\//i.test(config.publicBaseUrl))
+    ? config.publicBaseUrl.replace(/\/+$/, '')
+    : null;
   let configCache = null;
   let workingShell = null;
   let homePromise = null;
@@ -41,17 +59,16 @@ export function apply(ctx) {
     return homePromise;
   }
 
-  // Runtime origin of the web GUI (DSH_WEB_URL), probed lazily and cached.
-  // The /dsh-img2 route is served by the same webServer as the GUI, whose port
-  // is dynamic (--port 0), so hardcoding it breaks image display across restarts.
+  // Runtime origin of the web GUI, probed lazily and cached. The /dsh-img2 route
+  // is served by the same webServer as the GUI, whose port is dynamic (--port 0),
+  // so hardcoding it would break image display across restarts.
   let resolvedOrigin = null;
   let originPromise = null;
   function ensureWebOrigin(signal, cwd) {
     if (resolvedOrigin) return Promise.resolve(resolvedOrigin);
     if (!originPromise) {
       originPromise = (async () => {
-        // The /dsh-img2 route lives on the same webServer service as the GUI,
-        // so webServer.port is the single source of truth for the display URL.
+        if (publicOrigin) return publicOrigin;
         try {
           const port = webServer && typeof webServer.port === 'number' && webServer.port > 0 ? webServer.port : 0;
           if (port) return 'http://127.0.0.1:' + port;
@@ -157,6 +174,448 @@ export function apply(ctx) {
     return 'img-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8) + '.bin';
   }
 
+  // ── vision: sha256 + disk-persisted evidence cache ────────────────────────
+  // read_image describes a picture once, stores the evidence text keyed by the
+  // image digest, and reuses it forever — across steps AND across restarts.
+  function sha256OfBytes(bytes) {
+    // lazy dynamic import keeps the plugin zero-dep at load time
+    return import('node:crypto').then(({ createHash }) => createHash('sha256').update(bytes).digest('hex'));
+  }
+
+  let visionCacheHomePromise = null;
+  function visionCacheDir() {
+    if (!visionCacheHomePromise) {
+      visionCacheHomePromise = (async () => {
+        const home = await userHome();
+        return home + '\\.dsh\\imgpost-vision-cache';
+      })();
+    }
+    return visionCacheHomePromise;
+  }
+
+  async function readVisionCache(sha) {
+    try {
+      const dir = await visionCacheDir();
+      const target = await fs.resolve(dir + '\\' + sha + '.json');
+      const raw = await fs.readText(target, undefined, 512 * 1024);
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed.text === 'string' && parsed.text) return parsed;
+    } catch (e) {
+      // miss or unreadable — fall through to the engine
+    }
+    return null;
+  }
+
+  const NEGATIVE_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
+  function isNegativeCacheFresh(entry) {
+    if (!entry || entry.refused !== true) return false;
+    return Date.now() - (entry.savedAt || 0) < NEGATIVE_CACHE_TTL_MS;
+  }
+
+  async function writeVisionCache(sha, text, model, refused) {
+    try {
+      const dir = await visionCacheDir();
+      const payload = JSON.stringify({ text: text, model: model || '', savedAt: Date.now(), refused: refused === true });
+      const escaped = payload.replace(/'/g, "''");
+      const script = [
+        "$ErrorActionPreference='Stop'",
+        '$d=' + "'" + dir.replace(/'/g, "''") + "'",
+        'if (-not (Test-Path $d)) { New-Item -ItemType Directory -Force -Path $d | Out-Null }',
+        '$p=Join-Path $d $env:CACHE_SHA',
+        "[IO.File]::WriteAllText($p, '" + escaped + "', [Text.UTF8Encoding]::new($false))",
+      ].join('\n');
+      await runPwsh(script, { CACHE_SHA: sha + '.json' }, undefined, 'C:\\');
+    } catch (e) {
+      // cache write is best-effort; never fail the read for it
+    }
+  }
+
+  // ── vision: backend resolution + OpenAI/Anthropic-compatible calls ───────
+  // Precedence: ~/.dsh/vision-sender.json { primary, fallback } →
+  // env DSH_VISION_* → (nothing vendor-specific). The model listed in each
+  // backend config is honoured as-is; there is no default vendor model fallback.
+  let visionConfigCache = null;
+  async function resolveVisionConfig(signal, cwd, refresh) {
+    if (visionConfigCache && !refresh) return visionConfigCache;
+    let vRaw = null;
+    try {
+      const home = await userHome();
+      const vp = await fs.resolve(home + '\\.dsh\\vision-sender.json');
+      vRaw = await fs.readText(vp, signal, 128 * 1024);
+    } catch (e) {
+      vRaw = null;
+    }
+    let primary = null;
+    let fallback = null;
+    try {
+      if (vRaw) {
+        const v = JSON.parse(vRaw);
+        if (v && v.primary) primary = normalizeVisionBackend(v.primary);
+        if (v && v.fallback) fallback = normalizeVisionBackend(v.fallback);
+        if (v && !v.primary && v.baseURL) primary = normalizeVisionBackend(v);
+      }
+    } catch (e) {
+      // malformed vision-sender.json — fall through to env
+    }
+    if (!primary) {
+      const envKey = (typeof process !== 'undefined' && process.env && process.env.DSH_VISION_API_KEY) || null;
+      const envBase = (typeof process !== 'undefined' && process.env && process.env.DSH_VISION_API_BASE) || null;
+      const envModel = (typeof process !== 'undefined' && process.env && process.env.DSH_VISION_API_MODEL) || null;
+      if (envKey && envBase) primary = { baseURL: envBase, apiKey: envKey, model: envModel || '', format: 'openai' };
+    }
+    visionConfigCache = { primary, fallback };
+    return visionConfigCache;
+  }
+
+  function normalizeVisionBackend(b) {
+    return {
+      baseURL: String(b.baseURL || b.baseUrl || '').replace(/\/+$/, ''),
+      apiKey: String(b.apiKey || ''),
+      model: String(b.model || b.modelName || ''),
+      format: b.format === 'anthropic' ? 'anthropic' : 'openai',
+    };
+  }
+
+  // Call one OpenAI- or Anthropic-compatible vision endpoint with the image as
+  // base64. Returns the model's text answer.
+  async function callVisionBackend(backend, bytes, mediaType, prompt, signal) {
+    if (!backend || !backend.baseURL || !backend.apiKey) throw new Error('vision backend is not configured');
+    if (!backend.model) throw new Error('vision backend has no model configured');
+    const b64 = Buffer.from(bytes).toString('base64');
+    const userPrompt = (prompt && String(prompt).trim()) || 'Describe this image in detail: what is in it, any text (transcribe it), layout, colors, and anything notable.';
+    let url;
+    let headers;
+    let body;
+    if (backend.format === 'anthropic') {
+      const root = backend.baseURL.replace(/\/+$/, '');
+      url = /\/v\d+$/.test(root) ? root + '/messages' : root + '/v1/messages';
+      headers = {
+        'content-type': 'application/json',
+        'x-api-key': backend.apiKey,
+        'anthropic-version': '2023-06-01',
+      };
+      body = {
+        model: backend.model,
+        max_tokens: 2048,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: userPrompt },
+              { type: 'image', source: { type: 'base64', media_type: mediaType, data: b64 } },
+            ],
+          },
+        ],
+      };
+    } else {
+      url = backend.baseURL.replace(/\/+$/, '') + '/chat/completions';
+      headers = {
+        'content-type': 'application/json',
+        authorization: 'Bearer ' + backend.apiKey,
+      };
+      body = {
+        model: backend.model,
+        max_tokens: 2048,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: userPrompt },
+              { type: 'image_url', image_url: { url: 'data:' + mediaType + ';base64,' + b64 } },
+            ],
+          },
+        ],
+      };
+    }
+    const controller = new AbortController();
+    const onAbort = () => controller.abort();
+    signal && signal.addEventListener && signal.addEventListener('abort', onAbort, { once: true });
+    const timeoutMs = 120000;
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    let resp;
+    try {
+      resp = await fetch(url, {
+        method: 'POST',
+        headers: headers,
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+    } catch (e) {
+      if (e && (e.name === 'AbortError' || /abort/i.test(String(e && e.message || e)))) {
+        throw new Error('vision backend timed out after ' + (timeoutMs / 1000) + 's');
+      }
+      throw new Error('vision backend request failed: ' + String(e && e.message || e));
+    } finally {
+      clearTimeout(timeout);
+      signal && signal.removeEventListener && signal.removeEventListener('abort', onAbort);
+    }
+    if (!resp.ok) {
+      const detail = await extractApiError(resp);
+      const status = resp.status;
+      if (status === 401 || status === 403) {
+        throw new Error('vision backend auth failed (bad or expired key / quota): ' + detail);
+      } else if (status === 429) {
+        throw new Error('vision backend rate-limited (busy / rate limit): ' + detail);
+      } else if (status === 402) {
+        throw new Error('vision backend out of credits: ' + detail);
+      } else if (status === 404) {
+        throw new Error('vision backend endpoint not found: ' + detail);
+      } else if (status === 408) {
+        throw new Error('vision backend request timeout: ' + detail);
+      } else if (status >= 500) {
+        throw new Error('vision backend server error (' + status + '): ' + detail);
+      }
+      throw new Error('vision API ' + status + ': ' + detail);
+    }
+    const data = await resp.json();
+    let text = '';
+    try {
+      if (backend.format === 'anthropic') {
+        text = (data.content || []).map((b) => b.type === 'text' ? b.text : '').join('').trim();
+      } else {
+        text = (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || '';
+        if (Array.isArray(text)) text = text.map((b) => b.text || '').join('');
+      }
+    } catch (e) {
+      // keep empty text
+    }
+    if (!text) throw new Error('vision API returned no text');
+    return String(text).trim();
+  }
+
+  async function extractApiError(resp) {
+    let detail = '';
+    try {
+      const raw = await resp.text();
+      const parsed = JSON.parse(raw);
+      const e = parsed && parsed.error;
+      if (e) {
+        detail = String(e.message || e.messageText || e.msg || '').trim();
+        if (!detail) detail = String(e.type || e.code || '').trim();
+      }
+      if (!detail) detail = raw.slice(0, 240);
+    } catch (e) {
+      try { detail = (await resp.text()).slice(0, 240); } catch (e2) { }
+    }
+    return detail || ('HTTP ' + resp.status);
+  }
+
+  // Core: describe image BYTES through the vision backend with disk cache.
+  async function describeBytes(bytes, mediaType, prompt, signal, refresh) {
+    if (!mediaType || !/^image\//.test(mediaType)) mediaType = 'image/png';
+    const sha = await sha256OfBytes(bytes);
+    if (!refresh) {
+      const cached = await readVisionCache(sha);
+      if (cached) {
+        return { text: cached.text, model: cached.model || '', cached: true, refused: cached.refused === true, sha: sha, mediaType: mediaType, bytes: bytes.length };
+      }
+    }
+    const cfg = await resolveVisionConfig(signal, 'C:\\', refresh);
+    let lastError = null;
+    if (cfg.primary) {
+      try {
+        const text = await callVisionBackend(cfg.primary, bytes, mediaType, prompt, signal);
+        if (!isUsefulVisionText(text)) {
+          throw new Error('vision backend declined: ' + text.slice(0, 120));
+        }
+        await writeVisionCache(sha, text, cfg.primary.model);
+        return { text: text, model: cfg.primary.model, cached: false, sha: sha, mediaType: mediaType, bytes: bytes.length };
+      } catch (e) {
+        lastError = e;
+      }
+    }
+    if (cfg.fallback) {
+      try {
+        const text = await callVisionBackend(cfg.fallback, bytes, mediaType, prompt, signal);
+        if (!isUsefulVisionText(text)) {
+          throw new Error('vision backend declined: ' + text.slice(0, 120));
+        }
+        await writeVisionCache(sha, text, cfg.fallback.model);
+        return { text: text, model: cfg.fallback.model, cached: false, sha: sha, mediaType: mediaType, bytes: bytes.length };
+      } catch (e) {
+        lastError = e;
+      }
+    }
+    const lastMsg = String(lastError && lastError.message || lastError);
+    if (lastError && /declined|could not be read|refus|declin/i.test(lastMsg)) {
+      const declinedText = '[imgpost vision] 该图片因内容安全策略被视觉服务拒绝，暂无法生成描述。可尝试用 refresh 重新请求，或换一个视觉后端。';
+      await writeVisionCache(sha, declinedText, (cfg.fallback && cfg.fallback.model) || (cfg.primary && cfg.primary.model) || '', true);
+      return { text: declinedText, model: (cfg.fallback && cfg.fallback.model) || '', cached: false, refused: true, sha: sha, mediaType: mediaType, bytes: bytes.length };
+    }
+    throw new Error('read_image failed' + (lastError ? ': ' + lastMsg : ' (no vision backend configured; set ~/.dsh/vision-sender.json or DSH_VISION_*)'));
+  }
+
+  function isUsefulVisionText(text) {
+    const t = String(text || '').trim();
+    if (!t || t.length < 4) return false;
+    return !/我无法|我不能|无法(?:为您|提供|完成|处理|描述|满足)|不能(?:描述|处理|提供|回答|满足)|不(?:方便|能)提供|拒绝|违反(?:安全|内容|隐私)|\bas an? (?:ai|assistant)\b|\bi'?m (?:an? )?(?:ai|language model|assistant)\b|cannot (?:describe|process|handle|provide|do)|(?:refus|declin|unable to|not able to|can'?t|cannot|won'?t) (?:to )?(?:describe|process|handle|provide|do|fulfill|engage|assist)|i (?:can'?t|cannot|won'?t|don'?t) (?:describe|provide|process|handle|fulfill|engage|comply)|i'?m (?:unable|not able) (?:to )?(?:describe|process|handle|provide)|i don'?t (?:describe|provide|engage|do)|not supported|cannot comply|sorry,? (?:i|couldn)/gi.test(t);
+  }
+
+  // Read an image from a local path / http(s) URL / data URI / attachment ref.
+  async function readImageWithVision(exec, src, prompt, refresh) {
+    const cwd = cwdFor(exec);
+    let bytes;
+    let mediaType = 'image/png';
+    if (/^sha256:/i.test(src) || /^[a-f0-9]{64}$/i.test(src)) {
+      const hex = String(src).replace(/^sha256:/i, '').toLowerCase();
+      const home = await userHome();
+      const target = await fs.resolve(home + '\\.dsh\\attachments\\v1\\objects\\' + hex.slice(0, 2) + '\\' + hex);
+      bytes = await fs.readBytes(target, exec.signal, 40 * 1024 * 1024);
+      mediaType = sniffMediaType(bytes) || 'image/png';
+    } else if (/^data:/i.test(src)) {
+      const m = /^data:([^;,]+)?(;base64)?,(.*)$/s.exec(src);
+      if (!m || !m[2]) throw new Error('image data URI must be base64-encoded (data:image/png;base64,...)');
+      bytes = Buffer.from(m[3], 'base64');
+      mediaType = sniffMediaType(bytes) || m[1] || 'image/png';
+    } else if (/^https?:\/\//i.test(src)) {
+      const tmp = await fetchImageToFile(src, exec.signal, cwd);
+      bytes = await readImageBytesFromFile(tmp, exec.signal);
+      await deleteTempFile(tmp, exec.signal, cwd);
+      mediaType = sniffMediaType(bytes) || 'image/png';
+    } else {
+      const target = await fs.resolve(src, { cwd: cwd });
+      bytes = await fs.readBytes(target, exec.signal, 40 * 1024 * 1024);
+      mediaType = sniffMediaType(bytes) || 'image/png';
+    }
+    return await describeBytes(bytes, mediaType, prompt, exec.signal, refresh);
+  }
+
+  // ── vision: provider wrapper (imgpost-<upstream>) ─────────────────────────
+  function contentHasImage(blocks) {
+    return (
+      Array.isArray(blocks) &&
+      blocks.some((b) => b && (b.type === 'image' || (b.type === 'tool-result' && contentHasImage(b.content))))
+    );
+  }
+
+  async function convertMessageContent(blocks, signal) {
+    const out = [];
+    for (const block of blocks) {
+      if (!block || typeof block !== 'object') {
+        out.push(block);
+        continue;
+      }
+      if (block.type === 'image') {
+        const attachmentId = block.attachment && (block.attachment.attachmentId || block.attachment.ref && block.attachment.ref.attachmentId);
+        if (attachmentId) {
+          try {
+            const hex = String(attachmentId).replace(/^sha256:/i, '').toLowerCase();
+            const home = await userHome();
+            const target = await fs.resolve(home + '\\.dsh\\attachments\\v1\\objects\\' + hex.slice(0, 2) + '\\' + hex);
+            const bytes = await fs.readBytes(target, signal, 40 * 1024 * 1024);
+            const mediaType = sniffMediaType(bytes) || 'image/png';
+            const result = await describeBytes(bytes, mediaType, undefined, signal, false);
+            out.push({ type: 'text', text: '[Pasted image, described by imgpost vision]\n' + result.text });
+          } catch (e) {
+            out.push({ type: 'text', text: '[A pasted image could not be read by imgpost vision: ' + String(e && e.message || e).slice(0, 300) + ']' });
+          }
+        } else {
+          out.push({ type: 'text', text: '[A pasted image had no readable attachment reference]' });
+        }
+      } else if (block.type === 'tool-result' && contentHasImage(block.content)) {
+        out.push({ ...block, content: await convertMessageContent(block.content, signal) });
+      } else {
+        out.push(block);
+      }
+    }
+    return out;
+  }
+
+  async function convertMessagesImages(messages, signal) {
+    const out = [];
+    for (const message of messages) {
+      if (!message || typeof message !== 'object' || !contentHasImage(message.content)) {
+        out.push(message);
+        continue;
+      }
+      out.push({ ...message, content: await convertMessageContent(message.content, signal) });
+    }
+    return out;
+  }
+
+  // Register an imgpost-<upstream> adapter that wraps one text-only provider.
+  function registerVisionWrap(llm, upstream, providerId, displayName) {
+    try {
+      llm.registerAdapter([providerId], {
+        providerInfo() { return { id: providerId, name: displayName }; },
+        providerRetryPolicy() { return undefined; },
+        async listModels(_provider, signal) {
+          const models = await llm.listModels(upstream, signal);
+          return (models || []).map((m) => ({
+            ...m,
+            provider: providerId,
+            inputModalities: ['text', 'image'],
+          }));
+        },
+        async resolveModel(_provider, model, signal) {
+          const info = await llm.resolveModelInfo(upstream, model, signal);
+          return { ...info, provider: providerId, inputModalities: ['text', 'image'] };
+        },
+        stream(options) {
+          const self = this;
+          return (async function* () {
+            const messages = await convertMessagesImages(options.messages, options.signal);
+            yield* llm.stream({ ...options, provider: upstream, messages });
+          })();
+        },
+      });
+      return true;
+    } catch (error) {
+      if (/already|duplicate/i.test(String(error))) {
+        console.error('[imgpost] vision provider ' + providerId + ' already registered, keeping the existing one');
+        return true;
+      }
+      console.error('[imgpost] vision provider registration skipped (' + providerId + '): ' + error);
+      return false;
+    }
+  }
+
+  // Auto-discover text-only providers and wrap each one as imgpost-<id>.
+  function registerVisionProvider(llm) {
+    if (!llm || typeof llm.registerAdapter !== 'function' || typeof llm.listProviders !== 'function') return;
+    const wrapped = new Set();
+    const wrap = (id, name) => {
+      const providerId = 'imgpost-' + id;
+      return registerVisionWrap(llm, id, providerId, (name || id) + ' (imgpost vision)');
+    };
+    const ensureWrap = (id, name) => {
+      if (!id || wrapped.has(id)) return;
+      wrap(id, name).then((ok) => { if (!ok) wrapped.delete(id); });
+    };
+    const sweepBody = async () => {
+      for (const info of llm.listProviders()) {
+        const id = info && info.id;
+        if (!id || wrapped.has(id) || String(id).indexOf('imgpost-') === 0 || String(id).indexOf('modlens-') === 0 || String(id).indexOf('deepseek-modlens') === 0) continue;
+        let known = false;
+        let nativelyVision = false;
+        try {
+          const models = await llm.listModels(id);
+          if (Array.isArray(models) && models.length > 0) {
+            known = true;
+            nativelyVision = models.some((m) => Array.isArray(m.inputModalities) && m.inputModalities.indexOf('image') >= 0);
+          }
+        } catch (e) {
+          // unreadable right now — wrap anyway; a later sweep can revisit
+        }
+        if (known && nativelyVision) continue;
+        wrapped.add(id);
+        if (!await wrap(id, (info && info.name) || id)) {
+          wrapped.delete(id);
+        }
+      }
+    };
+    let sweeping = sweepBody();
+    const sweep = () => {
+      sweeping = sweeping.then(sweepBody, sweepBody);
+      return sweeping;
+    };
+    if (typeof ctx.on === 'function') {
+      ctx.on('llm/adapters-updated', () => {
+        void sweep();
+      });
+    }
+  }
+
   async function fetchImageToFile(url, signal, cwd) {
     const script = [
       '[Console]::OutputEncoding=[System.Text.Encoding]::UTF8',
@@ -260,8 +719,6 @@ export function apply(ctx) {
       '    }',
       '  } catch {}',
       '}',
-      "if (-not $base) { $base='https://api.openai.com/v1' }",
-      "if (-not $model) { $model='gpt-image-1' }",
       'Write-Output $key',
       'Write-Output $base',
       'Write-Output $model',
@@ -379,7 +836,7 @@ export function apply(ctx) {
 
   const generateImageTool = {
     name: 'generate_image',
-    description: 'Call the configured image-generation API and store the resulting image as an attachment served at a /dsh-img2/<sha256-hex> URL (the tool result carries the full URL). Requires credentials: env DSH_IMAGE_API_KEY (plus optional DSH_IMAGE_API_BASE and DSH_IMAGE_API_MODEL), or ~/.dsh/image-sender.json with { apiKey, baseURL, model }. Works with OpenAI-compatible /images/generations endpoints (OpenAI, SiliconFlow, Agnes AI, etc.) returning data[].url or data[].b64_json. IMPORTANT: after a successful call, you MUST render the image inside your reply by inserting the exact markdown image syntax ![caption](<the full URL from the tool result>) — never just quote the URL as plain text, otherwise the user sees no image.',
+    description: 'Call the configured image-generation API and store the resulting image as an attachment served at a /dsh-img2/<sha256-hex> URL (the tool result carries the full URL). Requires credentials: env DSH_IMAGE_API_KEY (plus optional DSH_IMAGE_API_BASE and DSH_IMAGE_API_MODEL), or ~/.dsh/image-sender.json with { apiKey, baseURL, model }. Works with any OpenAI-compatible /images/generations endpoint returning data[].url or data[].b64_json. IMPORTANT: after a successful call, you MUST render the image inside your reply by inserting the exact markdown image syntax ![caption](<the full URL from the tool result>) — never just quote the URL as plain text, otherwise the user sees no image.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -427,7 +884,7 @@ export function apply(ctx) {
       await ensureWebOrigin(exec.signal, cwd);
       const cfg = await resolveConfig(exec.signal, cwd, args.refreshConfig === true);
       if (!cfg.key) {
-        throw new Error('image-generation API key is not configured. Set the DSH_IMAGE_API_KEY environment variable (optionally DSH_IMAGE_API_BASE and DSH_IMAGE_API_MODEL), or create ~/.dsh/image-sender.json containing { "apiKey": "...", "baseURL": "https://api.siliconflow.cn/v1", "model": "..." }.');
+        throw new Error('image-generation API key is not configured. Set the DSH_IMAGE_API_KEY environment variable (optionally DSH_IMAGE_API_BASE and DSH_IMAGE_API_MODEL), or create ~/.dsh/image-sender.json containing { "apiKey": "...", "baseURL": "https://your-provider.example/v1", "model": "..." }.');
       }
       const tempPath = await generateImageToFile(cfg, prompt, args.size, args.model, exec.signal, cwd);
       const bytes = await stageBytes(exec, tempPath);
@@ -448,11 +905,59 @@ export function apply(ctx) {
     },
   };
 
+  const readImageTool = {
+    name: 'imgpost_read_image',
+    description: 'Read an image through an external vision API and return a detailed text description (OCR / layout / scene / any specific question). Unlike the host read_image tool, this works with ANY model — it does not require the model to declare image input, because the vision call happens outside the model. Accepts a local file path, an http(s) URL, a base64 data URI, or a sha256: attachment id. Uses the configured vision backend (primary ~/.dsh/vision-sender.json, fallback supported, or env DSH_VISION_*) and caches the result on disk keyed by the image digest, so the same image is only ever described once — even across restarts. Use whenever you need to know what is in an image.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        image: { type: 'string', description: 'Image source: local file path (absolute or workspace-relative), http(s) URL, base64 data URI, or sha256:<hex> attachment id.' },
+        prompt: { type: 'string', description: 'Optional specific question or focus for the reading, e.g. "transcribe all text" or "describe the layout". Defaults to a general detailed description.' },
+        refresh: { type: 'boolean', description: 'Re-run the vision backend even when a cached description exists.' },
+      },
+      required: ['image'],
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          text: { type: 'string' },
+          model: { type: 'string' },
+          cached: { type: 'boolean' },
+          refused: { type: 'boolean' },
+          sha: { type: 'string' },
+          mediaType: { type: 'string' },
+          bytes: { type: 'integer' },
+        },
+        required: ['text', 'model', 'cached', 'sha'],
+      },
+      render(args, value) {
+        return [{ type: 'text', text: (value.cached ? '[cached] ' : '') + value.text }];
+      },
+    },
+    timeoutMs: 240000,
+    async execute(args, exec) {
+      const src = String(args.image || '').trim();
+      if (!src) throw new Error('image is required');
+      return await readImageWithVision(exec, src, args.prompt, args.refresh === true);
+    },
+  };
+
   ctx.effect(() => {
     const disposers = [
       ctx.tools.register(sendImageTool),
       ctx.tools.register(generateImageTool),
+      ctx.tools.register(readImageTool),
     ];
+    if (llm !== undefined) {
+      try {
+        registerVisionProvider(llm);
+      } catch (error) {
+        console.error('[imgpost] vision provider registration failed: ' + error);
+      }
+    }
     if (webServer !== undefined) {
       const routeDisposer = webServer.register({
         kind: 'prefix',
@@ -493,5 +998,5 @@ export function apply(ctx) {
       for (const d of disposers) d();
     };
   });
-  ctx.logger?.info('imgpost: registered send_image / generate_image + /dsh-img2 route');
+  ctx.logger?.info('imgpost: registered send_image / generate_image / read_image + vision provider wrap + /dsh-img2 route');
 }
