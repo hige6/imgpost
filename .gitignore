@@ -1,11 +1,21 @@
 # Never commit credentials
 image-sender.json
+vision-sender.json
 .env
 *.local
 
 # Node
 node_modules/
 pnpm-lock.yaml
+
+# Local backups / scratch (hand-rolled copies of host.js etc.)
+*.bak
+*.bak-*
+*.bak2
+*.bak3
+*.orig
+*.rej
+*.tmp
 
 # OS
 Thumbs.db

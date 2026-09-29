@@ -1,6 +1,6 @@
 {
   "name": "imgpost",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "图邮 (imgpost)：让你的 DSH 能发图、会看图 —— 本地图片、网页图片、AI 生图 + 识图（一只眼睛），一键发进对话里。",
   "type": "module",
   "main": "src/host.js",
@@ -9,6 +9,8 @@
   },
   "files": [
     "src",
+    "scripts",
+    "cordis.patch.yml",
     "README.md",
     "LICENSE"
   ],
@@ -29,6 +31,11 @@
     "chat"
   ],
   "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/hige6/imgpost.git"

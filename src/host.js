@@ -1,26 +1,27 @@
 // imgpost（图邮） — host plugin, zero dependencies.
-// Three image capabilities in DSH conversations:
-//   1. send_image    — ship a local file / http(s) URL / data URI / attachment
-//                      into the chat as a durable /dsh-img2/<sha256> image.
-//   2. generate_image— call any OpenAI-compatible /images/generations endpoint
-//                      and post the result into the chat.
-//   3. read_image    — describe an image through an external vision API
-//                      (OpenAI- or Anthropic-compatible), cached on disk keyed
-//                      by the image digest so a restart never re-reads it.
+// Tools: send_image (post any image into the chat), generate_image (any
+// OpenAI-compatible /images/generations endpoint), imgpost_read_image (read an
+// image through an external vision API, disk-cached), imgpost_check_backend.
 // Images are stored as durable attachments and served back through a
-// same-origin /dsh-img2/<sha256-hex> webServer route.
+// same-origin /dsh-img2/<sha256> webServer route so the chat can display them.
+// Nothing vendor-specific is hardcoded anywhere: no provider, no base URL, no
+// model name, no local path is assumed — whichever endpoint and model the
+// config names is what gets called.
 //
-// Config (all optional, nothing baked in to any particular vendor):
-//   Generation : env DSH_IMAGE_API_KEY / DSH_IMAGE_API_BASE / DSH_IMAGE_API_MODEL
-//                or ~/.dsh/image-sender.json { apiKey, baseURL, model }.
-//   Vision     : ~/.dsh/vision-sender.json { primary, fallback, upstreams }
-//                (each backend { baseURL, apiKey, model, format:'openai'|'anthropic' }),
-//                else env DSH_VISION_API_KEY / DSH_VISION_API_BASE / DSH_VISION_API_MODEL.
-//                Evidence is cached in ~/.dsh/imgpost-vision-cache/<sha256>.json.
+// Config for generation (optional): env DSH_IMAGE_API_KEY / DSH_IMAGE_API_BASE
+// / DSH_IMAGE_API_MODEL, or ~/.dsh/image-sender.json { apiKey, baseURL, model }.
+//
+// Vision (read_image): ~/.dsh/vision-sender.json { primary, fallback } where
+// each backend is { baseURL, apiKey, model, format: 'openai' | 'anthropic' },
+// or the env trio DSH_VISION_API_KEY / DSH_VISION_API_BASE /
+// DSH_VISION_API_MODEL. Nothing vendor-specific is assumed: the model the
+// config names is the model that gets called. Evidence text is cached on disk
+// at ~/.dsh/imgpost-vision-cache/<sha256>.json so a restart never re-reads a
+// picture that was already described once.
 export const name = 'imgpost';
 // Hard dependencies: the loader parks this plugin until these host services are
-// provided, so apply() never races startup order. `llm` powers the vision
-// provider wrap (imgpost-<upstream>) that lets pasted images pass admission.
+// provided, so apply() never races startup order. `llm` guarantees the vision
+// provider wrap registers after the model registry is live.
 export const inject = ['attachments', 'subprocess', 'fs', 'webServer', 'tools', 'llm'];
 
 const shellCandidates = [
@@ -37,8 +38,8 @@ export function apply(ctx, config) {
   const webServer = ctx.get('webServer');
   const sandboxPolicy = ctx.get('sandboxPolicy');
   const llm = ctx.get('llm');
-  // Optional public base URL for served images (e.g. a Tailscale tailnet), falls
-  // back to the runtime-probed web origin (webServer.port → DSH_WEB_URL → default).
+  // 可配置的对外图片基址：配置了就用它（适配 Tailscale/tailnet 远程访问），
+  // 否则回退到运行时探测（webServer.port → DSH_WEB_URL → 默认）。
   const publicOrigin = (config && typeof config.publicBaseUrl === 'string' && /^https?:\/\//i.test(config.publicBaseUrl))
     ? config.publicBaseUrl.replace(/\/+$/, '')
     : null;
@@ -59,16 +60,19 @@ export function apply(ctx, config) {
     return homePromise;
   }
 
-  // Runtime origin of the web GUI, probed lazily and cached. The /dsh-img2 route
-  // is served by the same webServer as the GUI, whose port is dynamic (--port 0),
-  // so hardcoding it would break image display across restarts.
+  // Runtime origin of the web GUI (DSH_WEB_URL), probed lazily and cached.
+  // The /dsh-img2 route is served by the same webServer as the GUI, whose port
+  // is dynamic (--port 0), so hardcoding it breaks image display across restarts.
   let resolvedOrigin = null;
   let originPromise = null;
   function ensureWebOrigin(signal, cwd) {
     if (resolvedOrigin) return Promise.resolve(resolvedOrigin);
     if (!originPromise) {
       originPromise = (async () => {
+        // 优先用配置的对外基址（Tailscale 远程访问时，手机/电脑共用 tailnet HTTPS）。
         if (publicOrigin) return publicOrigin;
+        // The /dsh-img2 route lives on the same webServer service as the GUI,
+        // so webServer.port is the single source of truth for the display URL.
         try {
           const port = webServer && typeof webServer.port === 'number' && webServer.port > 0 ? webServer.port : 0;
           if (port) return 'http://127.0.0.1:' + port;
@@ -177,6 +181,8 @@ export function apply(ctx, config) {
   // ── vision: sha256 + disk-persisted evidence cache ────────────────────────
   // read_image describes a picture once, stores the evidence text keyed by the
   // image digest, and reuses it forever — across steps AND across restarts.
+  // A process-local Map would die with the process, and every restart would
+  // re-run the vision engine over the whole history — so this one lives on disk.
   function sha256OfBytes(bytes) {
     // lazy dynamic import keeps the plugin zero-dep at load time
     return import('node:crypto').then(({ createHash }) => createHash('sha256').update(bytes).digest('hex'));
@@ -206,6 +212,10 @@ export function apply(ctx, config) {
     return null;
   }
 
+  // A "negative" cache entry records that both vision backends declined the
+  // image (NSFW etc.). We store it too, so a restarted session does not re-run
+  // the (slow) vision API over the same refused pictures every time — the
+  // refusal is served from disk and only retried after NEGATIVE_CACHE_TTL_MS.
   const NEGATIVE_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
   function isNegativeCacheFresh(entry) {
     if (!entry || entry.refused !== true) return false;
@@ -216,6 +226,7 @@ export function apply(ctx, config) {
     try {
       const dir = await visionCacheDir();
       const payload = JSON.stringify({ text: text, model: model || '', savedAt: Date.now(), refused: refused === true });
+      // write through pwsh: fs.writeText may be denied under workspace-write
       const escaped = payload.replace(/'/g, "''");
       const script = [
         "$ErrorActionPreference='Stop'",
@@ -231,9 +242,10 @@ export function apply(ctx, config) {
   }
 
   // ── vision: backend resolution + OpenAI/Anthropic-compatible calls ───────
-  // Precedence: ~/.dsh/vision-sender.json { primary, fallback } →
-  // env DSH_VISION_* → (nothing vendor-specific). The model listed in each
-  // backend config is honoured as-is; there is no default vendor model fallback.
+  // Precedence: ~/.dsh/vision-sender.json { primary, fallback } → env
+  // DSH_VISION_*. Nothing vendor-specific is assumed: the model named in the
+  // config is the model that gets called. primary is tried first; on any
+  // failure the fallback (if configured) is tried before giving up.
   let visionConfigCache = null;
   async function resolveVisionConfig(signal, cwd, refresh) {
     if (visionConfigCache && !refresh) return visionConfigCache;
@@ -260,8 +272,8 @@ export function apply(ctx, config) {
     if (!primary) {
       const envKey = (typeof process !== 'undefined' && process.env && process.env.DSH_VISION_API_KEY) || null;
       const envBase = (typeof process !== 'undefined' && process.env && process.env.DSH_VISION_API_BASE) || null;
-      const envModel = (typeof process !== 'undefined' && process.env && process.env.DSH_VISION_API_MODEL) || null;
-      if (envKey && envBase) primary = { baseURL: envBase, apiKey: envKey, model: envModel || '', format: 'openai' };
+      const envModel = (typeof process !== 'undefined' && process.env && process.env.DSH_VISION_API_MODEL) || '';
+      if (envKey && envBase) primary = { baseURL: envBase, apiKey: envKey, model: envModel, format: 'openai' };
     }
     visionConfigCache = { primary, fallback };
     return visionConfigCache;
@@ -277,16 +289,18 @@ export function apply(ctx, config) {
   }
 
   // Call one OpenAI- or Anthropic-compatible vision endpoint with the image as
-  // base64. Returns the model's text answer.
+  // base64. Returns the model's text answer. Throws on transport/API failure
+  // with a friendly, classified message so the caller can decide fallback.
   async function callVisionBackend(backend, bytes, mediaType, prompt, signal) {
     if (!backend || !backend.baseURL || !backend.apiKey) throw new Error('vision backend is not configured');
-    if (!backend.model) throw new Error('vision backend has no model configured');
+    if (!backend.model) throw new Error('vision backend has no model configured (set "model" in ~/.dsh/vision-sender.json, or DSH_VISION_API_MODEL)');
     const b64 = Buffer.from(bytes).toString('base64');
     const userPrompt = (prompt && String(prompt).trim()) || 'Describe this image in detail: what is in it, any text (transcribe it), layout, colors, and anything notable.';
     let url;
     let headers;
     let body;
     if (backend.format === 'anthropic') {
+      // baseURL may or may not already carry /v1 (e.g. https://host/v1)
       const root = backend.baseURL.replace(/\/+$/, '');
       url = /\/v\d+$/.test(root) ? root + '/messages' : root + '/v1/messages';
       headers = {
@@ -383,6 +397,8 @@ export function apply(ctx, config) {
     return String(text).trim();
   }
 
+  // Extract a friendly message from an error response body across the two
+  // shapes providers use: {"error":{"message":...}} and {"error":{..."message":...}}.
   async function extractApiError(resp) {
     let detail = '';
     try {
@@ -401,12 +417,17 @@ export function apply(ctx, config) {
   }
 
   // Core: describe image BYTES through the vision backend with disk cache.
+  // No exec dependency — shared by the read_image tool and the provider wrap.
   async function describeBytes(bytes, mediaType, prompt, signal, refresh) {
     if (!mediaType || !/^image\//.test(mediaType)) mediaType = 'image/png';
     const sha = await sha256OfBytes(bytes);
     if (!refresh) {
       const cached = await readVisionCache(sha);
       if (cached) {
+        // A refused image is cached too (negative cache). It stays cached —
+        // a content-policy refusal almost never changes, so a short TTL would
+        // only re-run the slow API for the same refusal. Only an explicit
+        // refresh re-tries it.
         return { text: cached.text, model: cached.model || '', cached: true, refused: cached.refused === true, sha: sha, mediaType: mediaType, bytes: bytes.length };
       }
     }
@@ -415,6 +436,8 @@ export function apply(ctx, config) {
     if (cfg.primary) {
       try {
         const text = await callVisionBackend(cfg.primary, bytes, mediaType, prompt, signal);
+        // A refusal/policy answer is not a usable description: don't cache it,
+        // and treat it as a failure so the fallback backend gets a chance.
         if (!isUsefulVisionText(text)) {
           throw new Error('vision backend declined: ' + text.slice(0, 120));
         }
@@ -436,22 +459,34 @@ export function apply(ctx, config) {
         lastError = e;
       }
     }
+    // Both backends failed. Decide: a CONTENT refusal is near-permanent (the
+    // image is what it is), so cache the refusal as a negative entry and return
+    // a usable message — the next encounter is served from disk instantly. A
+    // transport/config error (timeout, 401/quota, 5xx) is transient and must
+    // NOT be cached, so it still throws (and can be retried on refresh).
     const lastMsg = String(lastError && lastError.message || lastError);
     if (lastError && /declined|could not be read|refus|declin/i.test(lastMsg)) {
       const declinedText = '[imgpost vision] 该图片因内容安全策略被视觉服务拒绝，暂无法生成描述。可尝试用 refresh 重新请求，或换一个视觉后端。';
       await writeVisionCache(sha, declinedText, (cfg.fallback && cfg.fallback.model) || (cfg.primary && cfg.primary.model) || '', true);
       return { text: declinedText, model: (cfg.fallback && cfg.fallback.model) || '', cached: false, refused: true, sha: sha, mediaType: mediaType, bytes: bytes.length };
     }
-    throw new Error('read_image failed' + (lastError ? ': ' + lastMsg : ' (no vision backend configured; set ~/.dsh/vision-sender.json or DSH_VISION_*)'));
+    throw new Error('read_image failed' + (lastError ? ': ' + lastMsg : ' (no vision backend configured; set ~/.dsh/vision-sender.json or DSH_VISION_API_KEY / DSH_VISION_API_BASE / DSH_VISION_API_MODEL)'));
   }
 
+  // Heuristic: is this returned text an actual description, or a refusal /
+  // boilerplate that should never be cached? Refusal phrases in common
+  // Chinese/English are treated as "no useful answer" so we try the fallback.
   function isUsefulVisionText(text) {
     const t = String(text || '').trim();
     if (!t || t.length < 4) return false;
+    // A reply that is just a refusal/non-answer should never be cached.
+    // Cover both refusal styles ("我无法提供该请求的帮助" / "I can't describe...",
+    // "I'm unable to...") and empty boilerplate.
     return !/我无法|我不能|无法(?:为您|提供|完成|处理|描述|满足)|不能(?:描述|处理|提供|回答|满足)|不(?:方便|能)提供|拒绝|违反(?:安全|内容|隐私)|\bas an? (?:ai|assistant)\b|\bi'?m (?:an? )?(?:ai|language model|assistant)\b|cannot (?:describe|process|handle|provide|do)|(?:refus|declin|unable to|not able to|can'?t|cannot|won'?t) (?:to )?(?:describe|process|handle|provide|do|fulfill|engage|assist)|i (?:can'?t|cannot|won'?t|don'?t) (?:describe|provide|process|handle|fulfill|engage|comply)|i'?m (?:unable|not able) (?:to )?(?:describe|process|handle|provide)|i don'?t (?:describe|provide|engage|do)|not supported|cannot comply|sorry,? (?:i|couldn)/gi.test(t);
   }
 
-  // Read an image from a local path / http(s) URL / data URI / attachment ref.
+  // Read an image from a local path / http(s) URL / data URI / attachment ref,
+  // run it through the vision backend with disk cache, and return the text.
   async function readImageWithVision(exec, src, prompt, refresh) {
     const cwd = cwdFor(exec);
     let bytes;
@@ -477,10 +512,15 @@ export function apply(ctx, config) {
       bytes = await fs.readBytes(target, exec.signal, 40 * 1024 * 1024);
       mediaType = sniffMediaType(bytes) || 'image/png';
     }
-    return await describeBytes(bytes, mediaType, prompt, exec.signal, refresh);
+    const result = await describeBytes(bytes, mediaType, prompt, exec.signal, refresh);
+    return result;
   }
 
   // ── vision: provider wrapper (imgpost-<upstream>) ─────────────────────────
+  // Declare image input so pastes/history pass the model admission gate, and
+  // rewrite image blocks into evidence text before
+  // the request goes upstream — but the rewrite is served from a DISK cache,
+  // so a restart never re-reads a picture that was described once.
   function contentHasImage(blocks) {
     return (
       Array.isArray(blocks) &&
@@ -488,6 +528,9 @@ export function apply(ctx, config) {
     );
   }
 
+  // Replace image blocks inside one message content array with cached evidence
+  // text blocks. Only `type: 'image'` blocks (pastes / attachments) are
+  // rewritten; text and everything else pass through untouched.
   async function convertMessageContent(blocks, signal) {
     const out = [];
     for (const block of blocks) {
@@ -533,19 +576,66 @@ export function apply(ctx, config) {
     return out;
   }
 
-  // Register an imgpost-<upstream> adapter that wraps one text-only provider.
+  // ── vision: native-vision model detection ─────────────────────────────────
+  // The core's image gate (dsh-llm-pi-ai) admits a pasted image only when the
+  // model's catalog entry declares image input, so that declaration is the
+  // single source of truth: a model is "native vision" exactly when the core
+  // would pass its images to the upstream unconverted. Models the catalog
+  // does not declare as vision are bridged instead — their image blocks are
+  // rewritten into cached evidence text — because a name guess cannot stand
+  // in: the gate would reject raw image blocks for such models anyway.
+  function modelIsNativeVision(modelMeta) {
+    if (!modelMeta || typeof modelMeta !== 'object') return false;
+    return Array.isArray(modelMeta.inputModalities) && modelMeta.inputModalities.indexOf('image') >= 0;
+  }
+
+  // Optional exclusion list: vision-sender.json `noWrap` — provider ids that
+  // must NOT get an imgpost-<id> wrapper (the user wants to keep them plain).
+  let noWrapCache = null;
+  async function noWrapList(signal) {
+    if (noWrapCache) return noWrapCache;
+    const list = new Set();
+    try {
+      const home = await userHome();
+      const target = await fs.resolve(home + '\\.dsh\\vision-sender.json');
+      const raw = await fs.readText(target, signal, 128 * 1024);
+      const parsed = JSON.parse(raw);
+      if (parsed && Array.isArray(parsed.noWrap)) {
+        for (const s of parsed.noWrap) if (String(s).trim()) list.add(String(s).trim());
+      }
+    } catch (e) {
+      // no file / no list — nothing excluded
+    }
+    noWrapCache = list;
+    return list;
+  }
+
+  // Register an imgpost-<upstream> adapter that wraps one provider whose
+  // models do not all accept image input natively. Models the catalog does
+  // not declare as vision get their image blocks rewritten into cached
+  // evidence text; models the catalog declares as vision are not offered by
+  // the wrap at all (the native provider serves them, images untouched), and
+  // a request for one that slips through is forwarded with raw image blocks.
+  // Returns { ok, owned, dispose }: ok=false means registration failed (retry
+  // on a later sweep); owned=false means someone else holds the provider
+  // route; dispose() removes our registration and emits llm/adapters-updated.
   function registerVisionWrap(llm, upstream, providerId, displayName) {
     try {
-      llm.registerAdapter([providerId], {
+      const handle = llm.registerAdapter([providerId], {
         providerInfo() { return { id: providerId, name: displayName }; },
-        providerRetryPolicy() { return undefined; },
+        providerRetryPolicy() { return llm.providerRetryPolicy(upstream); },
         async listModels(_provider, signal) {
           const models = await llm.listModels(upstream, signal);
-          return (models || []).map((m) => ({
-            ...m,
-            provider: providerId,
-            inputModalities: ['text', 'image'],
-          }));
+          return (models || [])
+            // Models the core already accepts images for are served by the
+            // native provider — the wrap only offers models that need the
+            // evidence bridge.
+            .filter((m) => !modelIsNativeVision(m))
+            .map((m) => ({
+              ...m,
+              provider: providerId,
+              inputModalities: ['text', 'image'],
+            }));
         },
         async resolveModel(_provider, model, signal) {
           const info = await llm.resolveModelInfo(upstream, model, signal);
@@ -554,59 +644,197 @@ export function apply(ctx, config) {
         stream(options) {
           const self = this;
           return (async function* () {
-            const messages = await convertMessagesImages(options.messages, options.signal);
-            yield* llm.stream({ ...options, provider: upstream, messages });
+            // Per-model pass-through: when the requested model's catalog entry
+            // accepts image input, the core gate lets raw image blocks reach
+            // the upstream — forward them untouched. For every other model the
+            // gate would reject raw images, so rewrite them into evidence text.
+            let native = false;
+            const modelId = options && options.model;
+            if (modelId) {
+              try {
+                native = modelIsNativeVision(await llm.resolveModelInfo(upstream, modelId, options.signal));
+              } catch (e) {
+                native = false; // unknown to the catalog — bridge it
+              }
+            }
+            const messages = native ? options.messages : await convertMessagesImages(options.messages, options.signal);
+            try {
+              yield* llm.stream({ ...options, provider: upstream, messages });
+            } catch (err) {
+              if (/no adapter registered/i.test(String(err && err.message))) {
+                throw new Error('imgpost 包装通道 "imgpost-' + upstream + '" 的上游 "' + upstream + '" 已不存在（配置里已删除）。请重启 DSH，或把它从 ~/.dsh/vision-sender.json 的 upstreams 列表里移除。');
+              }
+              throw err;
+            }
           })();
         },
+        // Bind exact model metadata and the eventual dispatch to one adapter
+        // generation, matching the LlmAdapter.prepareCall contract required by
+        // DSH >= 0.1.1-rc.2. Without this, the wrap's bare object literal does
+        // not inherit the base-class default and `adapter.prepareCall` is
+        // undefined, so DSH throws "prepareCall is not a function" on any
+        // imgpost-<id> route (e.g. imgpost-qwen).
+        async prepareCall(_provider, model, signal) {
+          return {
+            model: await this.resolveModel(_provider, model, signal),
+            stream: (options) => this.stream(options),
+          };
+        },
       });
-      return true;
+      return { ok: true, owned: true, dispose: () => { try { handle(); } catch (e) { /* already disposed */ } } };
     } catch (error) {
       if (/already|duplicate/i.test(String(error))) {
         console.error('[imgpost] vision provider ' + providerId + ' already registered, keeping the existing one');
-        return true;
+        return { ok: true, owned: false, dispose: null };
       }
       console.error('[imgpost] vision provider registration skipped (' + providerId + '): ' + error);
-      return false;
+      return { ok: false, owned: false, dispose: null };
     }
   }
 
-  // Auto-discover text-only providers and wrap each one as imgpost-<id>.
+  // Read the static wrap list from vision-sender.json `upstreams` (array of
+  // provider ids to wrap). Falls back to the DSH_IMGPOST_VISION_UPSTREAM env.
+  let wrapListCache = null;
+  async function resolveWrapList(signal, cwd, refresh) {
+    if (wrapListCache && !refresh) return wrapListCache;
+    const envUp = (typeof process !== 'undefined' && process.env && process.env.DSH_IMGPOST_VISION_UPSTREAM) || null;
+    let list = null;
+    try {
+      const home = await userHome();
+      const target = await fs.resolve(home + '\\.dsh\\vision-sender.json');
+      const raw = await fs.readText(target, undefined, 128 * 1024);
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed && parsed.upstreams) && parsed.upstreams.length > 0) {
+        list = parsed.upstreams.map((s) => String(s).trim()).filter(Boolean);
+      }
+    } catch (e) {
+      // no vision-sender.json upstreams — fall through
+    }
+    if ((!list || list.length === 0) && envUp) list = [envUp];
+    wrapListCache = list;
+    return list;
+  }
+
+  // Auto-discover providers and wrap each one that still needs the vision
+  // bridge as imgpost-<id>. This is the DEFAULT behaviour: any provider with
+  // at least one non-vision model gets a wrapper, so newly-added providers
+  // are covered automatically — no config edit needed. Models the core
+  // already accepts images for are NOT offered by the wrap (the native
+  // provider serves them, images untouched). A wrap is dropped again as soon
+  // as its upstream provider disappears (deleted from settings), becomes
+  // fully natively vision, or lands on the vision-sender.json `noWrap`
+  // exclusion list, so a removed provider never leaves a broken imgpost-<id>
+  // behind. vision-sender.json `upstreams` / env DSH_IMGPOST_VISION_UPSTREAM
+  // act only as an extra force-include list (belts for providers whose
+  // catalog is slow to appear); entries naming a provider that no longer
+  // exists are skipped with a one-time warning instead of a broken wrap.
   function registerVisionProvider(llm) {
     if (!llm || typeof llm.registerAdapter !== 'function' || typeof llm.listProviders !== 'function') return;
-    const wrapped = new Set();
-    const wrap = (id, name) => {
-      const providerId = 'imgpost-' + id;
-      return registerVisionWrap(llm, id, providerId, (name || id) + ' (imgpost vision)');
+    // upstream id -> disposer for registrations we own
+    const wrapped = new Map();
+    // upstream ids whose imgpost-<id> route is held by someone else (never retry)
+    const foreign = new Set();
+    const warnedMissing = new Set();
+    // Provider ids that belong to another vision bridge — never wrap those; two
+    // bridges on one route would collide.
+    const ownedPrefixes = ['imgpost-', 'modlens-', 'deepseek-modlens'];
+    const isOwnedByAnotherBridge = (id) => ownedPrefixes.some((p) => String(id).indexOf(p) === 0);
+
+    const ensureWrap = async (id, name) => {
+      if (wrapped.has(id) || foreign.has(id)) return;
+      const res = registerVisionWrap(llm, id, 'imgpost-' + id, (name || id) + ' (imgpost vision)');
+      if (!res.ok) return; // retry on a later sweep
+      if (res.owned) wrapped.set(id, res.dispose);
+      else foreign.add(id);
     };
-    const ensureWrap = (id, name) => {
-      if (!id || wrapped.has(id)) return;
-      wrap(id, name).then((ok) => { if (!ok) wrapped.delete(id); });
+
+    const dropWrap = (id) => {
+      const dispose = wrapped.get(id);
+      if (!dispose) return;
+      wrapped.delete(id);
+      dispose(); // removes the adapter and emits llm/adapters-updated
+    };
+
+    const sweepOnce = async () => {
+      try {
+        await sweepBody();
+      } catch (error) {
+        console.error('[imgpost] vision provider discovery sweep failed: ' + error);
+      }
     };
     const sweepBody = async () => {
-      for (const info of llm.listProviders()) {
+      const staticList = (await resolveWrapList(undefined, 'C:\\', false)) || [];
+      const excluded = await noWrapList(undefined);
+      let providers = [];
+      try {
+        providers = llm.listProviders() || [];
+      } catch (e) {
+        providers = [];
+      }
+      const present = new Set();
+      for (const p of providers) if (p && p.id) present.add(p.id);
+
+      // 1) Drop wraps that are no longer wanted: the upstream provider is
+      //    gone (removed from settings), or the user added it to the noWrap
+      //    exclusion list.
+      for (const id of [...wrapped.keys()]) {
+        if (present.has(id) && !excluded.has(id)) continue;
+        dropWrap(id);
+        ctx.logger?.info('[imgpost] unwrapped imgpost-' + id + ': ' + (excluded.has(id) ? 'listed in noWrap' : 'upstream provider no longer registered'));
+      }
+
+      // 2) Auto-discover: wrap every registered provider that is not one of
+      //    ours and not already wrapped — except providers whose catalog is
+      //    readable and whose models ALL accept image input natively. Mixed
+      //    providers stay wrapped so their text-only models keep the evidence
+      //    bridge, while their vision models pass images through. A provider
+      //    already wrapped that has become fully vision is unwrapped.
+      for (const info of providers) {
         const id = info && info.id;
-        if (!id || wrapped.has(id) || String(id).indexOf('imgpost-') === 0 || String(id).indexOf('modlens-') === 0 || String(id).indexOf('deepseek-modlens') === 0) continue;
-        let known = false;
-        let nativelyVision = false;
+        if (!id || wrapped.has(id) || foreign.has(id) || excluded.has(id) || isOwnedByAnotherBridge(id)) continue;
+        let allVision = false;
         try {
           const models = await llm.listModels(id);
           if (Array.isArray(models) && models.length > 0) {
-            known = true;
-            nativelyVision = models.some((m) => Array.isArray(m.inputModalities) && m.inputModalities.indexOf('image') >= 0);
+            allVision = true;
+            for (const m of models) {
+              if (!modelIsNativeVision(m)) { allVision = false; break; }
+            }
           }
         } catch (e) {
-          // unreadable right now — wrap anyway; a later sweep can revisit
+          // catalog unreadable right now — keep any existing wrap; new ones
+          // get wrapped below and a later sweep can revisit
         }
-        if (known && nativelyVision) continue;
-        wrapped.add(id);
-        if (!await wrap(id, (info && info.name) || id)) {
-          wrapped.delete(id);
+        if (allVision) {
+          if (wrapped.has(id)) {
+            dropWrap(id);
+            ctx.logger?.info('[imgpost] unwrapped imgpost-' + id + ': all models now accept image input natively');
+          }
+          continue;
         }
+        await ensureWrap(id, (info && info.name) || id);
+      }
+
+      // 3) Force-include: guarantee any provider named in the static list is
+      //    wrapped too, even if its catalog was not readable during this sweep
+      //    — but only while that provider actually exists. A stale entry
+      //    produces a one-time warning instead of a broken wrap.
+      for (const id of staticList) {
+        if (!id || typeof id !== 'string') continue;
+        if (wrapped.has(id) || foreign.has(id) || excluded.has(id)) continue;
+        if (!present.has(id)) {
+          if (!warnedMissing.has(id)) {
+            warnedMissing.add(id);
+            console.warn('[imgpost] vision-sender.json "upstreams" lists "' + id + '" but no such provider is registered — skipping wrap. Remove it from ~/.dsh/vision-sender.json if the provider is gone for good.');
+          }
+          continue;
+        }
+        await ensureWrap(id, id);
       }
     };
-    let sweeping = sweepBody();
+    let sweeping = sweepOnce();
     const sweep = () => {
-      sweeping = sweeping.then(sweepBody, sweepBody);
+      sweeping = sweeping.then(sweepOnce, sweepOnce);
       return sweeping;
     };
     if (typeof ctx.on === 'function') {
@@ -702,6 +930,9 @@ export function apply(ctx, config) {
 
   async function resolveConfig(signal, cwd, refresh) {
     if (configCache && !refresh) return configCache;
+    // No vendor default is baked in: whichever provider the user configures is
+    // the one that gets called. A missing piece surfaces as a clear tool error
+    // rather than silently hitting somebody else's endpoint.
     const script = [
       '[Console]::OutputEncoding=[System.Text.Encoding]::UTF8',
       "$ErrorActionPreference='SilentlyContinue'",
@@ -873,7 +1104,8 @@ export function apply(ctx, config) {
         const origin = resolvedOrigin || 'http://127.0.0.1:14330';
         const url = origin + '/dsh-img2/' + hex;
         const cap = (value.caption && String(value.caption)) || '图片';
-        return [{ type: 'text', text: '已生成图片：' + value.model + ' ' + value.size + ' ' + value.width + 'x' + value.height + '\n请在回复中以内嵌图片形式显示它（不要只贴 URL 文本）：\n![' + cap + '](' + url + ')' }];
+        const via = value.model || 'api';
+        return [{ type: 'text', text: '已生成图片（' + via + '）：' + value.size + ' ' + value.width + 'x' + value.height + '\n请在回复中以内嵌图片形式显示它（不要只贴 URL 文本）：\n![' + cap + '](' + url + ')' }];
       },
     },
     timeoutMs: 300000,
@@ -884,9 +1116,17 @@ export function apply(ctx, config) {
       await ensureWebOrigin(exec.signal, cwd);
       const cfg = await resolveConfig(exec.signal, cwd, args.refreshConfig === true);
       if (!cfg.key) {
-        throw new Error('image-generation API key is not configured. Set the DSH_IMAGE_API_KEY environment variable (optionally DSH_IMAGE_API_BASE and DSH_IMAGE_API_MODEL), or create ~/.dsh/image-sender.json containing { "apiKey": "...", "baseURL": "https://your-provider.example/v1", "model": "..." }.');
+        throw new Error('image-generation API key is not configured. Set the DSH_IMAGE_API_KEY environment variable, or create ~/.dsh/image-sender.json containing { "apiKey": "...", "baseURL": "https://your-provider.example/v1", "model": "..." }.');
+      }
+      if (!cfg.base) {
+        throw new Error('image-generation baseURL is not configured. Set DSH_IMAGE_API_BASE, or add "baseURL" to ~/.dsh/image-sender.json.');
+      }
+      const usedModel = args.model || cfg.model;
+      if (!usedModel) {
+        throw new Error('no image model configured. Set DSH_IMAGE_API_MODEL, or add "model" to ~/.dsh/image-sender.json, or pass the model argument.');
       }
       const tempPath = await generateImageToFile(cfg, prompt, args.size, args.model, exec.signal, cwd);
+      const usedSize = args.size || '1024x1024';
       const bytes = await stageBytes(exec, tempPath);
       const mediaType = sniffMediaType(bytes) || 'image/png';
       const base = await saveOnly(exec, bytes, mediaType, args.caption, undefined);
@@ -899,8 +1139,8 @@ export function apply(ctx, config) {
         bytes: base.bytes,
         caption: base.caption,
         prompt: prompt,
-        model: args.model || cfg.model,
-        size: args.size || '1024x1024',
+        model: usedModel,
+        size: usedSize,
       };
     },
   };
@@ -945,11 +1185,77 @@ export function apply(ctx, config) {
     },
   };
 
+  // ── backend health check (imgpost_check_backend) ─────────────────────────
+  // Reports whether image generation is usable WITHOUT calling the provider:
+  // which endpoint and model are configured, and which pieces are still missing.
+  async function checkBackends(exec, refresh) {
+    const cwd = cwdFor(exec);
+    const cfg = await resolveConfig(exec.signal, cwd, refresh === true);
+    const missing = [];
+    if (!cfg.key) missing.push('apiKey');
+    if (!cfg.base) missing.push('baseURL');
+    if (!cfg.model) missing.push('model');
+    return {
+      api: {
+        configured: missing.length === 0,
+        baseURL: cfg.base || '',
+        model: cfg.model || '',
+        hasKey: !!cfg.key,
+        missing: missing,
+      },
+    };
+  }
+
+  const checkBackendTool = {
+    name: 'imgpost_check_backend',
+    description: 'Check whether image generation is ready: reports the configured OpenAI-compatible endpoint, the model, whether an API key is present, and which pieces are still missing. Use it when generate_image failed with a configuration error, or before generating on a fresh machine.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        refreshConfig: { type: 'boolean', description: 'Re-read credentials/config instead of using the cached values.' },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: true,
+        properties: {
+          api: {
+            type: 'object',
+            properties: {
+              configured: { type: 'boolean' },
+              baseURL: { type: 'string' },
+              model: { type: 'string' },
+              hasKey: { type: 'boolean' },
+              missing: { type: 'array', items: { type: 'string' } },
+            },
+          },
+        },
+      },
+      render(args, value) {
+        const api = (value && value.api) || {};
+        const lines = [];
+        lines.push('api: ' + (api.configured ? '✅ 已配置' : '❌ 未配置完整'));
+        lines.push('    baseURL: ' + (api.baseURL || '（未设置）'));
+        lines.push('    model:   ' + (api.model || '（未设置）'));
+        lines.push('    apiKey:  ' + (api.hasKey ? '已设置' : '未设置'));
+        if (api.missing && api.missing.length) lines.push('    缺少: ' + api.missing.join('、'));
+        return [{ type: 'text', text: lines.join('\n') }];
+      },
+    },
+    timeoutMs: 30000,
+    async execute(args, exec) {
+      return await checkBackends(exec, args.refreshConfig === true);
+    },
+  };
+
   ctx.effect(() => {
     const disposers = [
       ctx.tools.register(sendImageTool),
       ctx.tools.register(generateImageTool),
       ctx.tools.register(readImageTool),
+      ctx.tools.register(checkBackendTool),
     ];
     if (llm !== undefined) {
       try {
