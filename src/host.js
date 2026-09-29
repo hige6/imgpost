@@ -24,12 +24,18 @@ export const name = 'imgpost';
 // provider wrap registers after the model registry is live.
 export const inject = ['attachments', 'subprocess', 'fs', 'webServer', 'tools', 'llm'];
 
-const shellCandidates = [
-  'pwsh',
-  'C:\\Program Files\\PowerShell\\7\\pwsh.exe',
-  'powershell',
-  'C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
-];
+// PowerShell 可执行文件候选：优先裸名（交给 PATH 解析），绝对路径一律从环境变量推导，
+// 不写死任何机器路径；对应的环境变量不存在就跳过那一项。
+function shellCandidates() {
+  const env = (typeof process !== 'undefined' && process.env) || {};
+  const out = ['pwsh'];
+  const programFiles = String(env.ProgramFiles || '').trim();
+  if (programFiles) out.push(programFiles.replace(/[\\/]+$/, '') + '\\PowerShell\\7\\pwsh.exe');
+  out.push('powershell');
+  const systemRoot = String(env.SystemRoot || env.windir || '').trim();
+  if (systemRoot) out.push(systemRoot.replace(/[\\/]+$/, '') + '\\System32\\WindowsPowerShell\\v1.0\\powershell.exe');
+  return out;
+}
 
 export function apply(ctx, config) {
   const attachments = ctx.get('attachments');
@@ -46,23 +52,69 @@ export function apply(ctx, config) {
   let configCache = null;
   let workingShell = null;
   let homePromise = null;
+  let dshHomePromise = null;
 
+  // 用户 home 在**本进程**解析，不再起 PowerShell 去问 $env:USERPROFILE：宿主会剥离子
+  // 进程环境里的 DSH_* 与凭据形状变量，为了拿一个 home 目录去起 shell 只会多一个失败点。
+  // 保持返回 Promise（所有调用点都是 await userHome()）。
   function userHome() {
     if (!homePromise) {
       homePromise = (async () => {
-        const cwd = sandboxPolicy && typeof sandboxPolicy.workspaceRoot === 'string' && sandboxPolicy.workspaceRoot ? sandboxPolicy.workspaceRoot : 'C:\\';
-        const out = await runPwsh('Write-Output $env:USERPROFILE', {}, undefined, cwd);
-        const home = out.replace(/\r/g, '').split('\n').map((s) => s.trim()).find((s) => s.length > 0);
-        if (!home) throw new Error('cannot resolve user home directory');
-        return home;
+        const env = (typeof process !== 'undefined' && process.env) || {};
+        const direct = String(env.USERPROFILE || env.HOME || '').trim();
+        if (direct) return direct.replace(/[\\/]+$/, '');
+        const os = await import('node:os');
+        const home = String(os.homedir() || '').trim();
+        if (!home) throw new Error('cannot resolve the user home directory (USERPROFILE/HOME unset and os.homedir() empty)');
+        return home.replace(/[\\/]+$/, '');
       })();
     }
     return homePromise;
   }
 
-  // Runtime origin of the web GUI (DSH_WEB_URL), probed lazily and cached.
-  // The /dsh-img2 route is served by the same webServer as the GUI, whose port
-  // is dynamic (--port 0), so hardcoding it breaks image display across restarts.
+  // $DSH_HOME 同样只能在**本进程**读（同一条剥离规则），优先级与宿主 dsh-home-paths 的
+  // resolveDshHome() 一致：显式配置 > $DSH_HOME（trim 后非空）> <os home>/.dsh；
+  // 支持 '~' / '~/' / '~\' 前缀展开，最后归一化成绝对路径。
+  function dshHome() {
+    if (!dshHomePromise) {
+      dshHomePromise = (async () => {
+        const path = await import('node:path');
+        const env = (typeof process !== 'undefined' && process.env) || {};
+        const configured = config && typeof config.dshHome === 'string' && config.dshHome.trim() ? config.dshHome.trim() : null;
+        const fromEnv = typeof env.DSH_HOME === 'string' && env.DSH_HOME.trim() ? env.DSH_HOME.trim() : null;
+        const override = configured || fromEnv;
+        if (!override) return path.join(await userHome(), '.dsh');
+        const os = await import('node:os');
+        const home = String(os.homedir() || '');
+        const expanded = override === '~'
+          ? home
+          : (override.startsWith('~/') || override.startsWith('~\\')) ? path.join(home, override.slice(2)) : override;
+        return path.resolve(expanded);
+      })();
+    }
+    return dshHomePromise;
+  }
+
+  // ~/.dsh 下的任何路径都从这里拼；别处不许再出现字面量 '.dsh'。
+  async function dshPath(...segments) {
+    const path = await import('node:path');
+    return path.join(await dshHome(), ...segments);
+  }
+
+  // 与会话无关的辅助进程（配置探测、缓存读写）用用户 home 当 cwd：它们不关心工作区，
+  // 也不该假设某个盘符存在。
+  async function homeCwd() {
+    try {
+      return await userHome();
+    } catch (e) {
+      return process.cwd();
+    }
+  }
+
+  // Runtime origin of the web GUI, probed lazily and cached. The /dsh-img2 route
+  // is served by the same webServer as the GUI, whose port is dynamic (--port 0),
+  // so a hardcoded port breaks image display across restarts. 顺序：配置的对外基址
+  // → webServer.port → DSH_WEB_URL（本进程读；子进程里 DSH_* 会被剥掉）→ 明确报错。
   let resolvedOrigin = null;
   let originPromise = null;
   function ensureWebOrigin(signal, cwd) {
@@ -77,28 +129,40 @@ export function apply(ctx, config) {
           const port = webServer && typeof webServer.port === 'number' && webServer.port > 0 ? webServer.port : 0;
           if (port) return 'http://127.0.0.1:' + port;
         } catch (e) {
-          // fall through to the env probes
+          // fall through to the env probe
         }
         try {
           const p = (typeof process !== 'undefined' && process.env && process.env.DSH_WEB_URL) || '';
           if (/^https?:\/\//i.test(p)) return p.replace(/\/+$/, '');
         } catch (e) {
-          // fall through to the spawn probe
+          // fall through to the explicit failure below
         }
-        try {
-          const out = await runPwsh('[Console]::OutputEncoding=[System.Text.Encoding]::UTF8\nWrite-Output $env:DSH_WEB_URL', {}, signal, cwd);
-          const line = out.replace(/\r/g, '').split('\n').map((s) => s.trim()).find((s) => /^https?:\/\//i.test(s));
-          if (line) return line.replace(/\/+$/, '');
-        } catch (e) {
-          // fall through to the default below
-        }
-        return 'http://127.0.0.1:14330';
+        throw new Error('cannot determine the web origin for image URLs: webServer.port is unset, DSH_WEB_URL is not set, and no publicBaseUrl is configured. Set publicBaseUrl in the imgpost plugin config (profile cordis.patch.yml).');
       })().then((o) => {
         resolvedOrigin = o;
         return o;
+      }, (error) => {
+        // 解析失败不要留下一个永远 reject 的 promise，下一次调用可以重试。
+        originPromise = null;
+        throw error;
       });
     }
     return originPromise;
+  }
+
+  // 渲染期（render()）用的基址：配置的对外基址优先（render() 可能是在新进程里回放历史，
+  // execute 没跑过，这时也必须用对外基址而不是回环地址）→ resolvedOrigin → webServer.port
+  // 现算；都没有就返回空串，URL 退化成同源相对路径 /dsh-img2/<hex>，绝不凭空造一个端口。
+  function renderOrigin() {
+    if (publicOrigin) return publicOrigin;
+    if (resolvedOrigin) return resolvedOrigin;
+    try {
+      const port = webServer && typeof webServer.port === 'number' && webServer.port > 0 ? webServer.port : 0;
+      if (port) return 'http://127.0.0.1:' + port;
+    } catch (e) {
+      // fall through to the relative form
+    }
+    return '';
   }
 
   function sniffMediaType(bytes) {
@@ -155,7 +219,7 @@ export function apply(ctx, config) {
       return { outcome: outcome, out: out, err: err };
     };
     let result = null;
-    const candidates = workingShell ? [workingShell] : shellCandidates;
+    const candidates = workingShell ? [workingShell] : shellCandidates();
     for (const exe of candidates) {
       const attemptResult = await attempt(exe);
       const bad = attemptResult.spawnError || !attemptResult.outcome || attemptResult.outcome.exitCode === 9009;
@@ -188,54 +252,80 @@ export function apply(ctx, config) {
     return import('node:crypto').then(({ createHash }) => createHash('sha256').update(bytes).digest('hex'));
   }
 
-  let visionCacheHomePromise = null;
-  function visionCacheDir() {
-    if (!visionCacheHomePromise) {
-      visionCacheHomePromise = (async () => {
-        const home = await userHome();
-        return home + '\\.dsh\\imgpost-vision-cache';
-      })();
-    }
-    return visionCacheHomePromise;
+  // 缓存键 = 图片 sha256 + 有效 prompt 的摘要（+ 后端身份）。换一个问题问同一张图不会
+  // 命中上一次的答案；provider 包装那条路传的是 prompt=undefined（固定通用提示），
+  // 它的键在重启之间保持稳定，缓存照旧命中。
+  const DEFAULT_VISION_PROMPT = 'Describe this image in detail: what is in it, any text (transcribe it), layout, colors, and anything notable.';
+
+  function isDefaultVisionPrompt(prompt) {
+    return !(prompt && String(prompt).trim());
   }
 
-  async function readVisionCache(sha) {
-    try {
-      const dir = await visionCacheDir();
-      const target = await fs.resolve(dir + '\\' + sha + '.json');
-      const raw = await fs.readText(target, undefined, 512 * 1024);
-      const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed.text === 'string' && parsed.text) return parsed;
-    } catch (e) {
-      // miss or unreadable — fall through to the engine
+  function effectiveVisionPrompt(prompt) {
+    return isDefaultVisionPrompt(prompt) ? DEFAULT_VISION_PROMPT : String(prompt).trim();
+  }
+
+  function sha256OfText(text) {
+    return import('node:crypto').then(({ createHash }) => createHash('sha256').update(String(text), 'utf8').digest('hex'));
+  }
+
+  // 兼容旧数据：默认提示 + 无后端身份时沿用旧的 <sha>.json 命名；其它情况用
+  // <sha>-<promptDigest>.json，并在读取时把旧文件当作回落（只在默认提示下才回落到旧文件）。
+  async function visionCacheKey(sha, prompt, backend) {
+    const ident = backend ? [backend.baseURL || '', backend.model || '', backend.format || ''].join('|') : '';
+    const isDefault = isDefaultVisionPrompt(prompt);
+    if (isDefault && !ident) return { key: sha, legacySha: null };
+    const digest = await sha256OfText(effectiveVisionPrompt(prompt) + '\u0000' + ident);
+    return { key: sha + '-' + digest.slice(0, 16), legacySha: isDefault ? sha : null };
+  }
+
+  async function readVisionCache(key, legacySha) {
+    const names = key === legacySha || !legacySha ? [key + '.json'] : [key + '.json', legacySha + '.json'];
+    for (const name of names) {
+      try {
+        const target = await fs.resolve(await dshPath('imgpost-vision-cache', name));
+        const raw = await fs.readText(target, undefined, 512 * 1024);
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed.text === 'string' && parsed.text) return parsed;
+      } catch (e) {
+        // miss or unreadable — try the next candidate, then the vision engine
+      }
     }
     return null;
   }
 
   // A "negative" cache entry records that both vision backends declined the
-  // image (NSFW etc.). We store it too, so a restarted session does not re-run
-  // the (slow) vision API over the same refused pictures every time — the
-  // refusal is served from disk and only retried after NEGATIVE_CACHE_TTL_MS.
+  // image (NSFW etc.). It is stored too, so a restarted session does not re-run
+  // the (slow) vision API over the same refused picture right away — but it
+  // EXPIRES after NEGATIVE_CACHE_TTL_MS, so a refusal is retried instead of
+  // being served forever. An explicit refresh always retries.
   const NEGATIVE_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
   function isNegativeCacheFresh(entry) {
     if (!entry || entry.refused !== true) return false;
     return Date.now() - (entry.savedAt || 0) < NEGATIVE_CACHE_TTL_MS;
   }
 
-  async function writeVisionCache(sha, text, model, refused) {
+  // 一次磁盘命中能不能用：正常条目永久可用，负缓存条目只在 TTL 内可用。
+  function isCacheEntryUsable(entry) {
+    if (!entry) return false;
+    if (entry.refused !== true) return true;
+    return isNegativeCacheFresh(entry);
+  }
+
+  async function writeVisionCache(key, text, model, refused) {
     try {
-      const dir = await visionCacheDir();
-      const payload = JSON.stringify({ text: text, model: model || '', savedAt: Date.now(), refused: refused === true });
+      const dir = await dshPath('imgpost-vision-cache');
+      const payload = JSON.stringify({ text: text, model: model || '', savedAt: Date.now(), refused: refused === true, key: key });
       // write through pwsh: fs.writeText may be denied under workspace-write
       const escaped = payload.replace(/'/g, "''");
       const script = [
         "$ErrorActionPreference='Stop'",
         '$d=' + "'" + dir.replace(/'/g, "''") + "'",
         'if (-not (Test-Path $d)) { New-Item -ItemType Directory -Force -Path $d | Out-Null }',
-        '$p=Join-Path $d $env:CACHE_SHA',
+        '$p=Join-Path $d $env:CACHE_NAME',
         "[IO.File]::WriteAllText($p, '" + escaped + "', [Text.UTF8Encoding]::new($false))",
       ].join('\n');
-      await runPwsh(script, { CACHE_SHA: sha + '.json' }, undefined, 'C:\\');
+      await runPwsh(script, { CACHE_NAME: key + '.json' }, undefined, await homeCwd());
     } catch (e) {
       // cache write is best-effort; never fail the read for it
     }
@@ -251,8 +341,7 @@ export function apply(ctx, config) {
     if (visionConfigCache && !refresh) return visionConfigCache;
     let vRaw = null;
     try {
-      const home = await userHome();
-      const vp = await fs.resolve(home + '\\.dsh\\vision-sender.json');
+      const vp = await fs.resolve(await dshPath('vision-sender.json'));
       vRaw = await fs.readText(vp, signal, 128 * 1024);
     } catch (e) {
       vRaw = null;
@@ -295,7 +384,7 @@ export function apply(ctx, config) {
     if (!backend || !backend.baseURL || !backend.apiKey) throw new Error('vision backend is not configured');
     if (!backend.model) throw new Error('vision backend has no model configured (set "model" in ~/.dsh/vision-sender.json, or DSH_VISION_API_MODEL)');
     const b64 = Buffer.from(bytes).toString('base64');
-    const userPrompt = (prompt && String(prompt).trim()) || 'Describe this image in detail: what is in it, any text (transcribe it), layout, colors, and anything notable.';
+    const userPrompt = effectiveVisionPrompt(prompt);
     let url;
     let headers;
     let body;
@@ -341,60 +430,67 @@ export function apply(ctx, config) {
         ],
       };
     }
+    // 调用方可能已经取消：先看一眼，别为一个注定被丢弃的结果发请求。
+    if (signal && signal.aborted) throw new Error('vision backend request was cancelled before it was sent');
     const controller = new AbortController();
     const onAbort = () => controller.abort();
     signal && signal.addEventListener && signal.addEventListener('abort', onAbort, { once: true });
     const timeoutMs = 120000;
-    const timeout = setTimeout(() => controller.abort(), timeoutMs);
-    let resp;
+    let timedOut = false;
+    const timeout = setTimeout(() => { timedOut = true; controller.abort(); }, timeoutMs);
+    // abort 监听与超时定时器必须包住"错误映射 + JSON 解析 + 取文"整段：只在 fetch 期间
+    // 生效的话，读响应体（resp.json() / extractApiError()）就完全没有保护。
     try {
-      resp = await fetch(url, {
+      const resp = await fetch(url, {
         method: 'POST',
         headers: headers,
         body: JSON.stringify(body),
         signal: controller.signal,
       });
-    } catch (e) {
-      if (e && (e.name === 'AbortError' || /abort/i.test(String(e && e.message || e)))) {
-        throw new Error('vision backend timed out after ' + (timeoutMs / 1000) + 's');
+      if (!resp.ok) {
+        const detail = await extractApiError(resp);
+        const status = resp.status;
+        if (status === 401 || status === 403) {
+          throw new Error('vision backend auth failed (bad or expired key / quota): ' + detail);
+        } else if (status === 429) {
+          throw new Error('vision backend rate-limited (busy / rate limit): ' + detail);
+        } else if (status === 402) {
+          throw new Error('vision backend out of credits: ' + detail);
+        } else if (status === 404) {
+          throw new Error('vision backend endpoint not found: ' + detail);
+        } else if (status === 408) {
+          throw new Error('vision backend request timeout: ' + detail);
+        } else if (status >= 500) {
+          throw new Error('vision backend server error (' + status + '): ' + detail);
+        }
+        throw new Error('vision API ' + status + ': ' + detail);
       }
-      throw new Error('vision backend request failed: ' + String(e && e.message || e));
+      const data = await resp.json();
+      let text = '';
+      try {
+        if (backend.format === 'anthropic') {
+          text = (data.content || []).map((b) => b.type === 'text' ? b.text : '').join('').trim();
+        } else {
+          text = (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || '';
+          if (Array.isArray(text)) text = text.map((b) => b.text || '').join('');
+        }
+      } catch (e) {
+        // keep empty text
+      }
+      if (!text) throw new Error('vision API returned no text');
+      return String(text).trim();
+    } catch (e) {
+      const msg = String(e && e.message || e);
+      const own = /^vision (backend|API)/.test(msg);
+      const abortish = timedOut || (e && e.name === 'AbortError') || /abort/i.test(msg);
+      if (own && !abortish) throw e;
+      if (timedOut) throw new Error('vision backend timed out after ' + (timeoutMs / 1000) + 's');
+      if (abortish) throw new Error('vision backend request was cancelled');
+      throw new Error('vision backend request failed: ' + msg);
     } finally {
       clearTimeout(timeout);
       signal && signal.removeEventListener && signal.removeEventListener('abort', onAbort);
     }
-    if (!resp.ok) {
-      const detail = await extractApiError(resp);
-      const status = resp.status;
-      if (status === 401 || status === 403) {
-        throw new Error('vision backend auth failed (bad or expired key / quota): ' + detail);
-      } else if (status === 429) {
-        throw new Error('vision backend rate-limited (busy / rate limit): ' + detail);
-      } else if (status === 402) {
-        throw new Error('vision backend out of credits: ' + detail);
-      } else if (status === 404) {
-        throw new Error('vision backend endpoint not found: ' + detail);
-      } else if (status === 408) {
-        throw new Error('vision backend request timeout: ' + detail);
-      } else if (status >= 500) {
-        throw new Error('vision backend server error (' + status + '): ' + detail);
-      }
-      throw new Error('vision API ' + status + ': ' + detail);
-    }
-    const data = await resp.json();
-    let text = '';
-    try {
-      if (backend.format === 'anthropic') {
-        text = (data.content || []).map((b) => b.type === 'text' ? b.text : '').join('').trim();
-      } else {
-        text = (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || '';
-        if (Array.isArray(text)) text = text.map((b) => b.text || '').join('');
-      }
-    } catch (e) {
-      // keep empty text
-    }
-    if (!text) throw new Error('vision API returned no text');
-    return String(text).trim();
   }
 
   // Extract a friendly message from an error response body across the two
@@ -421,17 +517,18 @@ export function apply(ctx, config) {
   async function describeBytes(bytes, mediaType, prompt, signal, refresh) {
     if (!mediaType || !/^image\//.test(mediaType)) mediaType = 'image/png';
     const sha = await sha256OfBytes(bytes);
+    // 缓存键里含后端/模型身份，所以先把后端解析出来（resolveVisionConfig 有内存缓存，
+    // 代价只有首次一次文件读）。
+    const cfg = await resolveVisionConfig(signal, await homeCwd(), refresh);
+    const cacheId = await visionCacheKey(sha, prompt, cfg.primary || cfg.fallback);
     if (!refresh) {
-      const cached = await readVisionCache(sha);
-      if (cached) {
-        // A refused image is cached too (negative cache). It stays cached —
-        // a content-policy refusal almost never changes, so a short TTL would
-        // only re-run the slow API for the same refusal. Only an explicit
-        // refresh re-tries it.
+      const cached = await readVisionCache(cacheId.key, cacheId.legacySha);
+      if (isCacheEntryUsable(cached)) {
+        // 负缓存（两个后端都因内容策略拒绝了这张图）只在 TTL 内命中：过期后重新尝试，
+        // 而不是把一次拒绝永久钉在磁盘上。显式 refresh 永远重试。
         return { text: cached.text, model: cached.model || '', cached: true, refused: cached.refused === true, sha: sha, mediaType: mediaType, bytes: bytes.length };
       }
     }
-    const cfg = await resolveVisionConfig(signal, 'C:\\', refresh);
     let lastError = null;
     if (cfg.primary) {
       try {
@@ -441,7 +538,7 @@ export function apply(ctx, config) {
         if (!isUsefulVisionText(text)) {
           throw new Error('vision backend declined: ' + text.slice(0, 120));
         }
-        await writeVisionCache(sha, text, cfg.primary.model);
+        await writeVisionCache(cacheId.key, text, cfg.primary.model);
         return { text: text, model: cfg.primary.model, cached: false, sha: sha, mediaType: mediaType, bytes: bytes.length };
       } catch (e) {
         lastError = e;
@@ -453,7 +550,7 @@ export function apply(ctx, config) {
         if (!isUsefulVisionText(text)) {
           throw new Error('vision backend declined: ' + text.slice(0, 120));
         }
-        await writeVisionCache(sha, text, cfg.fallback.model);
+        await writeVisionCache(cacheId.key, text, cfg.fallback.model);
         return { text: text, model: cfg.fallback.model, cached: false, sha: sha, mediaType: mediaType, bytes: bytes.length };
       } catch (e) {
         lastError = e;
@@ -467,7 +564,7 @@ export function apply(ctx, config) {
     const lastMsg = String(lastError && lastError.message || lastError);
     if (lastError && /declined|could not be read|refus|declin/i.test(lastMsg)) {
       const declinedText = '[imgpost vision] 该图片因内容安全策略被视觉服务拒绝，暂无法生成描述。可尝试用 refresh 重新请求，或换一个视觉后端。';
-      await writeVisionCache(sha, declinedText, (cfg.fallback && cfg.fallback.model) || (cfg.primary && cfg.primary.model) || '', true);
+      await writeVisionCache(cacheId.key, declinedText, (cfg.fallback && cfg.fallback.model) || (cfg.primary && cfg.primary.model) || '', true);
       return { text: declinedText, model: (cfg.fallback && cfg.fallback.model) || '', cached: false, refused: true, sha: sha, mediaType: mediaType, bytes: bytes.length };
     }
     throw new Error('read_image failed' + (lastError ? ': ' + lastMsg : ' (no vision backend configured; set ~/.dsh/vision-sender.json or DSH_VISION_API_KEY / DSH_VISION_API_BASE / DSH_VISION_API_MODEL)'));
@@ -478,7 +575,9 @@ export function apply(ctx, config) {
   // Chinese/English are treated as "no useful answer" so we try the fallback.
   function isUsefulVisionText(text) {
     const t = String(text || '').trim();
-    if (!t || t.length < 4) return false;
+    // 只把"空/空白"和明确的拒绝话术当作无内容：短答案（"42"、"OK"）是合法回答，
+    // 用长度门槛会把它们误判成拒绝并写进负缓存。
+    if (!t) return false;
     // A reply that is just a refusal/non-answer should never be cached.
     // Cover both refusal styles ("我无法提供该请求的帮助" / "I can't describe...",
     // "I'm unable to...") and empty boilerplate.
@@ -493,8 +592,7 @@ export function apply(ctx, config) {
     let mediaType = 'image/png';
     if (/^sha256:/i.test(src) || /^[a-f0-9]{64}$/i.test(src)) {
       const hex = String(src).replace(/^sha256:/i, '').toLowerCase();
-      const home = await userHome();
-      const target = await fs.resolve(home + '\\.dsh\\attachments\\v1\\objects\\' + hex.slice(0, 2) + '\\' + hex);
+      const target = await fs.resolve(await dshPath('attachments', 'v1', 'objects', hex.slice(0, 2), hex));
       bytes = await fs.readBytes(target, exec.signal, 40 * 1024 * 1024);
       mediaType = sniffMediaType(bytes) || 'image/png';
     } else if (/^data:/i.test(src)) {
@@ -504,8 +602,13 @@ export function apply(ctx, config) {
       mediaType = sniffMediaType(bytes) || m[1] || 'image/png';
     } else if (/^https?:\/\//i.test(src)) {
       const tmp = await fetchImageToFile(src, exec.signal, cwd);
-      bytes = await readImageBytesFromFile(tmp, exec.signal);
-      await deleteTempFile(tmp, exec.signal, cwd);
+      try {
+        bytes = await readImageBytesFromFile(tmp, exec.signal);
+      } finally {
+        // 清理必须用 undefined signal：调用方的 signal 可能已经被取消，runPwsh 会
+        // 立刻失败，文件就永远留在 %TEMP% 里了。
+        await deleteTempFile(tmp, undefined, cwd);
+      }
       mediaType = sniffMediaType(bytes) || 'image/png';
     } else {
       const target = await fs.resolve(src, { cwd: cwd });
@@ -543,8 +646,7 @@ export function apply(ctx, config) {
         if (attachmentId) {
           try {
             const hex = String(attachmentId).replace(/^sha256:/i, '').toLowerCase();
-            const home = await userHome();
-            const target = await fs.resolve(home + '\\.dsh\\attachments\\v1\\objects\\' + hex.slice(0, 2) + '\\' + hex);
+            const target = await fs.resolve(await dshPath('attachments', 'v1', 'objects', hex.slice(0, 2), hex));
             const bytes = await fs.readBytes(target, signal, 40 * 1024 * 1024);
             const mediaType = sniffMediaType(bytes) || 'image/png';
             const result = await describeBytes(bytes, mediaType, undefined, signal, false);
@@ -596,8 +698,7 @@ export function apply(ctx, config) {
     if (noWrapCache) return noWrapCache;
     const list = new Set();
     try {
-      const home = await userHome();
-      const target = await fs.resolve(home + '\\.dsh\\vision-sender.json');
+      const target = await fs.resolve(await dshPath('vision-sender.json'));
       const raw = await fs.readText(target, signal, 128 * 1024);
       const parsed = JSON.parse(raw);
       if (parsed && Array.isArray(parsed.noWrap)) {
@@ -624,6 +725,10 @@ export function apply(ctx, config) {
       const handle = llm.registerAdapter([providerId], {
         providerInfo() { return { id: providerId, name: displayName }; },
         providerRetryPolicy() { return llm.providerRetryPolicy(upstream); },
+        // LlmAdapter.imageRequestPricing(provider, model) 是 token meter 对每条已注册
+        // 路由都会调用的方法（dsh-llm: `this.adapters.get(provider)?.adapter.imageRequestPricing(...)`）；
+        // 普通对象字面量没有基类默认实现，漏了就是运行时 TypeError。整条委托给上游。
+        imageRequestPricing(_provider, model) { return llm.imageRequestPricing(upstream, model); },
         async listModels(_provider, signal) {
           const models = await llm.listModels(upstream, signal);
           return (models || [])
@@ -674,6 +779,13 @@ export function apply(ctx, config) {
         // not inherit the base-class default and `adapter.prepareCall` is
         // undefined, so DSH throws "prepareCall is not a function" on any
         // imgpost-<id> route (e.g. imgpost-qwen).
+        //
+        // 已知限制（故意不重构）：这里把"配置代际"绑到了调用对象上（model + stream），
+        // 但 stream 内部是 `yield* llm.stream({ provider: upstream })`，dispatch 那一刻
+        // 会按 provider id 重新解析上游适配器。所以上游 provider 被换掉（同 id 换配置）
+        // 时，已经 prepare 出来的调用对象会在下一次 dispatch 用上新配置，而不是冻结在
+        // prepare 时的代际。对本插件无害（包装只是转写图片块，不缓存上游能力），
+        // 故保留现状：改成逐代绑定需要复刻上游适配器的 prepareCall 语义，得不偿失。
         async prepareCall(_provider, model, signal) {
           return {
             model: await this.resolveModel(_provider, model, signal),
@@ -700,8 +812,7 @@ export function apply(ctx, config) {
     const envUp = (typeof process !== 'undefined' && process.env && process.env.DSH_IMGPOST_VISION_UPSTREAM) || null;
     let list = null;
     try {
-      const home = await userHome();
-      const target = await fs.resolve(home + '\\.dsh\\vision-sender.json');
+      const target = await fs.resolve(await dshPath('vision-sender.json'));
       const raw = await fs.readText(target, undefined, 128 * 1024);
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed && parsed.upstreams) && parsed.upstreams.length > 0) {
@@ -763,7 +874,7 @@ export function apply(ctx, config) {
       }
     };
     const sweepBody = async () => {
-      const staticList = (await resolveWrapList(undefined, 'C:\\', false)) || [];
+      const staticList = (await resolveWrapList(undefined, await homeCwd(), false)) || [];
       const excluded = await noWrapList(undefined);
       let providers = [];
       try {
@@ -933,34 +1044,50 @@ export function apply(ctx, config) {
     // No vendor default is baked in: whichever provider the user configures is
     // the one that gets called. A missing piece surfaces as a clear tool error
     // rather than silently hitting somebody else's endpoint.
-    const script = [
-      '[Console]::OutputEncoding=[System.Text.Encoding]::UTF8',
-      "$ErrorActionPreference='SilentlyContinue'",
-      '$key=$env:DSH_IMAGE_API_KEY',
-      '$base=$env:DSH_IMAGE_API_BASE',
-      '$model=$env:DSH_IMAGE_API_MODEL',
-      'if (-not $key -or -not $base) {',
-      '  try {',
-      "    $cfgPath=Join-Path $env:USERPROFILE '.dsh\\image-sender.json'",
-      '    if (Test-Path $cfgPath) {',
-      '      $cfg=Get-Content -Raw -Path $cfgPath | ConvertFrom-Json',
-      '      if (-not $key) { $key=$cfg.apiKey }',
-      '      if (-not $base) { $base=$cfg.baseURL }',
-      '      if (-not $model) { $model=$cfg.model }',
-      '    }',
-      '  } catch {}',
-      '}',
-      'Write-Output $key',
-      'Write-Output $base',
-      'Write-Output $model',
-    ].join('\n');
-    const out = await runPwsh(script, {}, signal, cwd);
-    const lines = out.replace(/\r/g, '').split('\n');
-    const cfg = {
-      key: (lines[0] || '').trim() || null,
-      base: (lines[1] || '').trim() || null,
-      model: (lines[2] || '').trim() || null,
-    };
+    //
+    // 环境变量必须在**本进程**读：宿主 dsh-subprocess 的 scrubbedParentEnv() 会剥掉
+    // 所有 DSH_ 前缀以及 KEY/PASSWORD/SECRET/TOKEN 形状的变量，子进程根本看不到它们
+    // （而宿主已经把 ~/.dsh/.env 并进了 process.env），所以本进程才是正确读取点。
+    const env = (typeof process !== 'undefined' && process.env) || {};
+    let key = String(env.DSH_IMAGE_API_KEY || '').trim() || null;
+    let base = String(env.DSH_IMAGE_API_BASE || '').trim() || null;
+    let model = String(env.DSH_IMAGE_API_MODEL || '').trim() || null;
+    if (!key || !base || !model) {
+      // 缺项再去读配置文件。路径显式传给子进程（显式 env 层会合并且不受剥离影响），
+      // 脚本只输出**一行 JSON**：原来三行 Write-Output 的写法里 `Write-Output $null`
+      // 不产生行，中间缺值会让后面的字段整体前移（缺 key 时会被解析成 hasKey=true）。
+      const cfgPath = await dshPath('image-sender.json');
+      const script = [
+        '[Console]::OutputEncoding=[System.Text.Encoding]::UTF8',
+        "$ErrorActionPreference='SilentlyContinue'",
+        // 子进程环境里的 DSH_* 一定为空（宿主会剥离，而本进程读到的值已在上面的 key/base/model
+        // 里），所以这里只从配置文件补齐缺的那几项。
+        '$key=""; $base=""; $model=""',
+        '$cfgPath=$env:IMGPOST_IMAGE_CONFIG',
+        'if ($cfgPath -and (Test-Path $cfgPath)) {',
+        '  try {',
+        '    $cfg=Get-Content -Raw -Path $cfgPath | ConvertFrom-Json',
+        '    $key=$cfg.apiKey; $base=$cfg.baseURL; $model=$cfg.model',
+        '  } catch {}',
+        '}',
+        '$json=@{ key=[string]$key; base=[string]$base; model=[string]$model } | ConvertTo-Json -Compress',
+        '[Console]::Out.Write($json)',
+      ].join('\n');
+      // 只把配置文件路径传进去。**不再**把 DSH_IMAGE_* 转发给子进程：本进程已经读到了
+      // 就够用了（本进程读不到的，子进程同样读不到），而把 apiKey 复制进一个子进程的
+      // 环境里只是多余的凭据外溢。
+      const out = await runPwsh(script, { IMGPOST_IMAGE_CONFIG: cfgPath }, signal, cwd);
+      try {
+        const parsed = JSON.parse(out.trim());
+        if (!key && parsed && typeof parsed.key === 'string' && parsed.key.trim()) key = parsed.key.trim();
+        if (!base && parsed && typeof parsed.base === 'string' && parsed.base.trim()) base = parsed.base.trim();
+        if (!model && parsed && typeof parsed.model === 'string' && parsed.model.trim()) model = parsed.model.trim();
+      } catch (e) {
+        // 子进程没吐出 JSON（例如 PowerShell 完全起不来时是空输出）：保留已解析到的
+        // 部分，由调用方按"缺哪一项"报错，别在这里吞掉真正的原因。
+      }
+    }
+    const cfg = { key: key, base: base, model: model };
     configCache = cfg;
     return cfg;
   }
@@ -970,7 +1097,9 @@ export function apply(ctx, config) {
     try {
       return await readImageBytesFromFile(tempPath, exec.signal);
     } finally {
-      await deleteTempFile(tempPath, exec.signal, cwd);
+      // 清理用 undefined signal：被取消的 signal 会让 runPwsh 直接失败，临时文件就
+      // 永远留在 %TEMP% 里了。
+      await deleteTempFile(tempPath, undefined, cwd);
     }
   }
 
@@ -1027,7 +1156,7 @@ export function apply(ctx, config) {
       presentationMeta: metaProjection,
       render(args, value) {
         const hex = String(value.attachmentId || '').replace(/^sha256:/, '');
-        const origin = resolvedOrigin || 'http://127.0.0.1:14330';
+        const origin = renderOrigin();
         const url = origin + '/dsh-img2/' + hex;
         const cap = (value.caption && String(value.caption)) || '图片';
         return [{ type: 'text', text: '已发送图片到对话：' + value.mediaType + ' ' + value.width + 'x' + value.height + '（' + value.bytes + ' 字节）\n请在回复中以内嵌图片形式显示它（不要只贴 URL 文本）：\n![' + cap + '](' + url + ')' }];
@@ -1067,7 +1196,7 @@ export function apply(ctx, config) {
 
   const generateImageTool = {
     name: 'generate_image',
-    description: 'Call the configured image-generation API and store the resulting image as an attachment served at a /dsh-img2/<sha256-hex> URL (the tool result carries the full URL). Requires credentials: env DSH_IMAGE_API_KEY (plus optional DSH_IMAGE_API_BASE and DSH_IMAGE_API_MODEL), or ~/.dsh/image-sender.json with { apiKey, baseURL, model }. Works with any OpenAI-compatible /images/generations endpoint returning data[].url or data[].b64_json. IMPORTANT: after a successful call, you MUST render the image inside your reply by inserting the exact markdown image syntax ![caption](<the full URL from the tool result>) — never just quote the URL as plain text, otherwise the user sees no image.',
+    description: 'Call the configured image-generation API and store the resulting image as an attachment served at a /dsh-img2/<sha256-hex> URL (the tool result carries the full URL). Requires all three of apiKey + baseURL + model: env DSH_IMAGE_API_KEY / DSH_IMAGE_API_BASE / DSH_IMAGE_API_MODEL, or ~/.dsh/image-sender.json with { apiKey, baseURL, model }. A missing piece fails with an error naming exactly which one is missing (imgpost_check_backend reports the same state without calling the provider). Works with any OpenAI-compatible /images/generations endpoint returning data[].url or data[].b64_json. IMPORTANT: after a successful call, you MUST render the image inside your reply by inserting the exact markdown image syntax ![caption](<the full URL from the tool result>) — never just quote the URL as plain text, otherwise the user sees no image.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -1101,7 +1230,7 @@ export function apply(ctx, config) {
       presentationMeta: metaProjection,
       render(args, value) {
         const hex = String(value.attachmentId || '').replace(/^sha256:/, '');
-        const origin = resolvedOrigin || 'http://127.0.0.1:14330';
+        const origin = renderOrigin();
         const url = origin + '/dsh-img2/' + hex;
         const cap = (value.caption && String(value.caption)) || '图片';
         const via = value.model || 'api';
@@ -1277,8 +1406,7 @@ export function apply(ctx, config) {
               res.end('bad attachment id');
               return;
             }
-            const home = await userHome();
-            const filePath = home + '\\.dsh\\attachments\\v1\\objects\\' + hex.slice(0, 2).toLowerCase() + '\\' + hex.toLowerCase();
+            const filePath = await dshPath('attachments', 'v1', 'objects', hex.slice(0, 2).toLowerCase(), hex.toLowerCase());
             const target = await fs.resolve(filePath);
             const bytes = await fs.readBytes(target, undefined, 40 * 1024 * 1024);
             const mediaType = sniffMediaType(bytes) || 'image/png';

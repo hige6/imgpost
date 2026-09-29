@@ -23,11 +23,33 @@ DSH 的 agent 原本只能发文字；装上 imgpost 之后，它就能把图片
 - peer 只声明范围 `@deepseek-ai/cordis: ^4.0.1`（**不是**精确版本），因此不会被新版 DSH 判成不兼容而拒载。
 - 没有写死的本机路径 / 盘符 / 端口 / 厂商模型名 —— 换台电脑克隆即用。
 
+### 这一版修掉的宿主契约问题（都经过独立评审复现）
+
+| 问题 | 后果 | 现状 |
+|---|---|---|
+| 包装适配器没实现 `imageRequestPricing()` | 宿主 token meter 对每条已注册路由都会调用它，字面量不继承基类默认实现 → 走 `imgpost-<上游>` 的请求直接 TypeError | 已实现，委托上游定价 |
+| 生图配置靠子进程读 `DSH_IMAGE_*` | 宿主 `scrubbedParentEnv()` 会剥掉所有 `DSH_` 前缀与 `KEY/PASSWORD/SECRET/TOKEN` 形状变量，子进程根本看不到 → 环境变量配置永远失效 | 改为**本进程**读，同时显式转发给子进程 |
+| 三行 `Write-Output` 传配置 | `Write-Output $null` 不产生行，中间缺值会让后续字段整体前移（缺 `apiKey` 会被读成"有 key"） | 改为一行 JSON，不再串位 |
+| 识图缓存只按图片指纹 | 换一个问题问同一张图仍返回上一个答案 | 缓存键 = 图片 + 问题 + 后端身份 |
+| 短答案被当拒绝 | `"42"` 这类有效答案被判成内容拒绝并写负缓存 | 只按"空/明确拒绝话术"判定 |
+| 临时文件泄漏 / 取消失效 | 下载或识图中途失败时 `%TEMP%` 残留；响应体读取阶段没有取消与超时保护 | 全部改 `finally` 清理；abort 与 120s 超时覆盖到响应体解析 |
+
+- `~/.dsh` 根目录遵循宿主 `dsh-home-paths` 的优先级：插件配置 `dshHome` > `$DSH_HOME` > `~/.dsh`，支持 `~` 展开。
+
 ## 🚀 安装
 
 ### 方式一：一键脚本（推荐，Windows / PowerShell）
 
-仓库里带了一个一键安装脚本 `scripts/install.ps1`：把插件放进 `~/.dsh/plugins/imgpost` → **备份** profile 的 `package.json` → 写入 `link:` 依赖与 `dsh.profile.bundles` 名单 → 校验 JSON，失败自动回滚 → 提示重启 DSH。
+仓库里带了一个一键安装脚本 `scripts/install.ps1`。执行顺序是**先只读后写入**：
+
+1. 只读探测插件来源、定位 profile、解析 JSON，先打印一份「将要改什么」的计划
+2. 交互确认（`-Yes` 可跳过）
+3. 备份 profile 的 `package.json` 与插件目录（就近存成 `<名字>.bak-<时间戳>`）
+4. 写入 `link:` 依赖与 `dsh.profile.bundles` 名单，写完立刻重新解析校验
+5. 任一步失败按相反顺序回滚；最后跑 `pnpm install` 并检查它的退出码
+
+退出码：`0` 成功 ｜ `1` 失败已回滚 ｜ `2` 配置已写但 `pnpm install` 未完成（脚本会给出可复制的补救命令）｜ `3` 用户取消。
+选 No 或中途失败时，插件目录与 profile 都保持原样（已有 18 个用例 / 72 项检查的回归矩阵覆盖）。
 
 ```powershell
 # 方式 A：本地 clone 后安装（自动探测 profile）
@@ -38,6 +60,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Profile desktop
 
 # 方式 C：直接通过 npm 安装到 ~/.dsh/plugins 并配置
 powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -FromNpm
+
+# 老版本 DSH（没有 dsh.profile 块）：脚本会自动改用 legacy 的 cordis.patch.yml 方式
 ```
 
 ### 方式二：手动 bundle 安装（DSH 0.2.x，推荐做法）
@@ -127,12 +151,27 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -FromNpm
 { "upstreams": ["provider-a"], "noWrap": ["provider-b"] }
 ```
 
+### （可选）改 DSH 根目录
+
+插件默认跟随宿主的 DSH 根目录优先级：插件配置 `dshHome` > 环境变量 `$DSH_HOME` > `~/.dsh`（支持 `~` 展开）。配置文件、识图缓存、附件对象都从同一个根推导：
+
+```yaml
+- id: imgpost
+  config:
+    dshHome: 'D:/dsh-home'
+```
+
 ## 🧩 技术要点
 
 - **零依赖**：核心逻辑直接用宿主端 Service（`attachments` / `fs` / `subprocess` / `webServer` / `tools` / `llm`），不引入第三方包。
-- **磁盘证据缓存**：识图结果按图片 SHA-256 缓存在 `~/.dsh/imgpost-vision-cache/`，同一张图只描述一次，跨重启不重读。
+- **磁盘证据缓存**：识图结果按「图片 SHA-256 + 问题 + 后端身份」缓存在 `<dsh home>/imgpost-vision-cache/`。同一张图同一个问题只描述一次、跨重启不重读；换问题会重新问一次。内容策略拒绝按负缓存存 1 小时，过期自动重试。
 - **跨电脑通用**：没有写死的本机路径 / 盘符 / 端口 / 厂商模型名，克隆即用。
 - **URL 稳定**：图片以内容寻址（sha256）落盘，同一张图重复发送得到同一个 URL。
+
+## ⚠️ 已知限制
+
+- **包装通道的配置代际**：`imgpost-<上游>` 适配器的 `prepareCall` 把模型元数据绑在了调用对象上，但真正的 dispatch 会按 provider id 重新解析上游适配器。因此上游 provider 被热替换（同 id 换配置）的瞬间，已 prepare 的调用会用上新配置。对本插件无害（包装只转写图片块、不缓存上游能力），所以保留现状。
+- **附件读取走路径拼接**：`/dsh-img2/<sha256>` 与识图读附件是按 `<dsh home>/attachments/v1/objects/<2位>/<sha256>` 拼路径读字节的，没有走宿主的 `attachments.imageHostPath()`。若宿主的附件后端不是本地文件系统那一种，这条例路由会 404。单机本地存储场景不受影响。
 
 ## 📄 License
 
