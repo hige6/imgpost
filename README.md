@@ -107,6 +107,18 @@ DSH 的 agent 原本只能发文字；装上 imgpost 之后，它就能把图片
 选 No、备份、写入或校验阶段失败时，插件目录与 profile 都保持原样；校验期抛异常也会先回滚再退出（回归矩阵 31 个用例 / 134 项检查覆盖）。
 注意 `exit 2` 是**有意保留现场**的：配置已经写好了，只差一次 `pnpm install`，不会回滚。
 
+### 方式零：从 DSH 的插件面板装（发布到 npm 后）
+
+DSH 侧边栏的 **Plugins** 页里有一个「添加插件」框，提示是「输入插件的包名、GitHub 仓库地址或本地目录路径」。也就是说生态入口就是 **npm 包名**：
+
+```
+imgpost
+```
+
+它背后是 `@deepseek-ai/dsh-plugin-manager`：按 npm 包名（或 git / tarball / 本地路径）用 profile 的 pnpm 安装，并在安装**之前**做兼容性检查。要让它在那个面板里被当成可管理的**bundle**（而不是普通依赖），`package.json` 必须声明 `dsh.bundle.patch` —— 本插件已经声明了。
+
+有一点值得单独说明：兼容性检查**只看 `@deepseek-ai/dsh` 与 `@deepseek-ai/dsh-*` 这些 peer**（源码在 `dsh-app-boot` 的 `evaluatePluginCompatibility`）。本插件只声明了 `@deepseek-ai/cordis: ^4.0.1`，不在这条检查范围内，所以不会因为 DSH 版本升级被拒装。若你以后加了 `dsh-*` 的 peer，请用范围（如 `^0.2.0-rc.2` / `>=0.1.0`）而**不要**钉精确的旧版本 —— 钉死会被在 pnpm 运行前直接拒绝（profile 里有 `compatibility.json` 豁免机制，但需要显式接受风险）。
+
 ```powershell
 # 方式 A：本地 clone 后安装（自动探测 profile）
 powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
