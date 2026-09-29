@@ -27,7 +27,7 @@ imgpost（图邮）一键安装脚本 —— Windows / PowerShell
   powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Profile desktop
   powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -FromNpm
   powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -LegacyPatch   # 老版 DSH：改写 cordis.patch.yml
-  powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -DshHome D:\dsh
+  powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -DshHome '<DSH 根目录>'
   powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Yes           # 不交互确认
 
 退出码：
@@ -73,10 +73,14 @@ function Say-Err([string]$m) { Write-Host $m -ForegroundColor Red }
 function Say-Dim([string]$m) { Write-Host $m -ForegroundColor DarkGray }
 function Fail([string]$message, [int]$code) {
   Say-Err ("错误：" + $message)
+  # 回滚没能完全还原时，退出码必须非零，哪怕调用方传了 0。
+  if ($code -eq 0 -and $script:RollbackFailures -and $script:RollbackFailures.Count -gt 0) { $code = 1 }
   exit $code
 }
 # 本次实际生成的备份列表（用于结尾提示）
 $script:BackupsMade = New-Object System.Collections.ArrayList
+# 回滚过程中还原失败的条目。单个条目失败不中断其余条目的还原，但必须记下来并让退出码非零。
+$script:RollbackFailures = New-Object System.Collections.ArrayList
 function Say-BackupNote {
   if ($script:BackupsMade.Count -gt 0) { Say-Dim ("备份： " + ($script:BackupsMade -join '   ')) }
 }
@@ -100,16 +104,26 @@ function Get-LinkTarget([string]$value, [string]$relativeTo) {
   return (Resolve-Full $p)
 }
 # 目录内全部文件的相对路径 -> SHA256（跳过 .git / node_modules / *.bak*）
+# 枚举一律 -ErrorAction Stop：静默漏文件会让"双向哈希校验"看不出任何问题，等于校验失效。
+# 计划阶段就会调用它做差异比对，所以枚举失败必然发生在任何写入之前。
 function Get-FileMap([string]$root) {
   $map = @{}
   if (-not (Test-Path -LiteralPath $root)) { return $map }
   $base = (Resolve-Full $root).TrimEnd('\', '/')
-  Get-ChildItem -LiteralPath $base -Recurse -File -Force -ErrorAction SilentlyContinue |
-    Where-Object { $_.FullName -notmatch '\\\.git\\' -and $_.FullName -notmatch '\\node_modules\\' -and $_.Name -notmatch '\.bak' } |
-    ForEach-Object {
-      $rel = $_.FullName.Substring($base.Length).TrimStart('\', '/')
-      $map[$rel] = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
+  try {
+    $files = Get-ChildItem -LiteralPath $base -Recurse -File -Force -ErrorAction Stop |
+      Where-Object { $_.FullName -notmatch '\\\.git\\' -and $_.FullName -notmatch '\\node_modules\\' -and $_.Name -notmatch '\.bak' }
+  } catch {
+    throw ("无法枚举目录内容：" + $base + " -> " + $_.Exception.Message)
+  }
+  foreach ($file in $files) {
+    $rel = $file.FullName.Substring($base.Length).TrimStart('\', '/')
+    try {
+      $map[$rel] = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256 -ErrorAction Stop).Hash
+    } catch {
+      throw ("无法读取文件哈希：" + $file.FullName + " -> " + $_.Exception.Message)
     }
+  }
   return $map
 }
 # 双向差异：Add = 源有目标缺失/不一致（需要写），Del = 目标有源没有（需要删）。
@@ -133,18 +147,24 @@ function Get-CopyDiff([string]$source, [string]$target) {
 # 把源目录整棵树复制到目标（含隐藏文件如 .gitignore，这是 Copy-Item 通配符写法会漏掉的）。
 # 排除规则必须与 Get-FileMap 一致（.git / node_modules / *.bak），否则做完复制的差异校验
 # 会因为被排除的文件而误报。
+# 枚举用 -ErrorAction Stop：漏文件必须当场失败。复制完成后的核对由 Get-CopyDiff 负责，
+# 它会**重新枚举**源与目标两侧，不复用这里可能不完整的清单。
 function Copy-Tree([string]$Source, [string]$Target) {
   $src = (Resolve-Full $Source).TrimEnd('\', '/')
+  try {
+    $files = Get-ChildItem -LiteralPath $src -Recurse -File -Force -ErrorAction Stop |
+      Where-Object { $_.FullName -notmatch '\\\.git\\' -and $_.FullName -notmatch '\\node_modules\\' -and $_.Name -notmatch '\.bak' }
+  } catch {
+    throw ("无法枚举源目录：" + $src + " -> " + $_.Exception.Message)
+  }
   New-Item -ItemType Directory -Force -Path $Target | Out-Null
-  Get-ChildItem -LiteralPath $src -Recurse -File -Force -ErrorAction SilentlyContinue |
-    Where-Object { $_.FullName -notmatch '\\\.git\\' -and $_.FullName -notmatch '\\node_modules\\' -and $_.Name -notmatch '\.bak' } |
-    ForEach-Object {
-      $rel = $_.FullName.Substring($src.Length).TrimStart('\', '/')
-      $dest = Join-Path $Target $rel
-      $parent = Split-Path -Path $dest -Parent
-      if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
-      Copy-Item -LiteralPath $_.FullName -Destination $dest -Force
-    }
+  foreach ($file in $files) {
+    $rel = $file.FullName.Substring($src.Length).TrimStart('\', '/')
+    $dest = Join-Path $Target $rel
+    $parent = Split-Path -Path $dest -Parent
+    if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
+    Copy-Item -LiteralPath $file.FullName -Destination $dest -Force -ErrorAction Stop
+  }
 }
 
 # ── 回滚机制：任何写入前先登记，失败时按相反顺序还原 ────────────────────────
@@ -158,30 +178,37 @@ function Invoke-Rollback {
   for ($i = $script:RollbackActions.Count - 1; $i -ge 0; $i--) {
     $a = $script:RollbackActions[$i]
     try {
+      # 所有文件操作都用终止性错误（-ErrorAction Stop）：默认的非终止性错误不会进 catch，
+      # 于是"已恢复"会被打印出来而文件其实没还原 —— 那是比不打印更糟的假成功。
       if ($a.Kind -eq 'file') {
-        if ($a.Backup -and (Test-Path -LiteralPath $a.Backup)) {
-          Copy-Item -LiteralPath $a.Backup -Destination $a.Target -Force
+        if ($a.Backup -and (Test-Path -LiteralPath $a.Backup -ErrorAction Stop)) {
+          Copy-Item -LiteralPath $a.Backup -Destination $a.Target -Force -ErrorAction Stop
           Say-Dim ("  已恢复 " + $a.Target)
         } elseif (-not $a.Backup) {
           # 登记时目标原本不存在（例如新建的 cordis.patch.yml）：回滚就是删掉它，
           # 否则"回滚成功"之后文件还在，等于没回滚。
-          if (Test-Path -LiteralPath $a.Target) {
-            Remove-Item -LiteralPath $a.Target -Force
+          if (Test-Path -LiteralPath $a.Target -ErrorAction Stop) {
+            Remove-Item -LiteralPath $a.Target -Force -ErrorAction Stop
             Say-Dim ("  已移除新建的 " + $a.Target)
           }
         }
       } elseif ($a.Kind -eq 'dir') {
-        if (Test-Path -LiteralPath $a.Target) { Remove-Item -LiteralPath $a.Target -Recurse -Force }
-        if ($a.Backup -and (Test-Path -LiteralPath $a.Backup)) {
-          Move-Item -LiteralPath $a.Backup -Destination $a.Target -Force
+        if (Test-Path -LiteralPath $a.Target -ErrorAction Stop) { Remove-Item -LiteralPath $a.Target -Recurse -Force -ErrorAction Stop }
+        if ($a.Backup -and (Test-Path -LiteralPath $a.Backup -ErrorAction Stop)) {
+          Move-Item -LiteralPath $a.Backup -Destination $a.Target -Force -ErrorAction Stop
           Say-Dim ("  已恢复 " + $a.Target)
         } else {
           Say-Dim ("  已移除新建的 " + $a.Target)
         }
       }
     } catch {
-      Say-Warn ("  回滚 " + $a.Target + " 失败：" + $_.Exception.Message)
+      # 单个条目失败不中断其余条目：继续还原后面的，但记下来并显著报出来。
+      Say-Err ("  回滚 " + $a.Target + " 失败：" + $_.Exception.Message)
+      [void]$script:RollbackFailures.Add($a.Target)
     }
+  }
+  if ($script:RollbackFailures.Count -gt 0) {
+    Say-Err ("回滚未完全成功，以下目标需要你手工核对：" + ($script:RollbackFailures -join '  '))
   }
 }
 
@@ -246,8 +273,35 @@ try {
 if ($null -eq $pkg) { Fail ("profile 的 package.json 是空的，已停止（未做任何改动）。") 1 }
 
 # ══ 阶段 3：只读计划 ═══════════════════════════════════════════════════════
-# 探测 legacy 需要改的 patch 文件状态（只读，供计划与后面的写入使用）
+# 在 patch 文本里找 imgpost 那一项，返回 id 行下标与缩进；找不到返回 -1。
+# 只读、不抛错：调用方（计划阶段）必须能在任何写入之前安全地跑它。
+function Find-LegacyEntry([string[]]$lines) {
+  for ($i = 0; $i -lt $lines.Count; $i++) {
+    if ($lines[$i] -match '^([ \t]*)-\s*id:\s*imgpost\s*$') {
+      return [pscustomobject]@{ Index = $i; Indent = $matches[1].Length }
+    }
+  }
+  return [pscustomobject]@{ Index = -1; Indent = 0 }
+}
+
+# 取 imgpost 那一项里的 name 值（同一项内、遇到同级或更浅的下一个 "- " 条目就停）。找不到返回 $null。
+function Get-LegacyEntryName([string[]]$lines, [int]$idIndex, [int]$idIndent) {
+  for ($j = $idIndex + 1; $j -lt $lines.Count; $j++) {
+    $line = $lines[$j]
+    if ($line.Trim() -eq '') { continue }
+    if ($line -match '^([ \t]*)-\s') { if ($matches[1].Length -le $idIndent) { break } else { continue } }
+    if ($line -match '^[ \t]*#') { continue }
+    if ($line -match '^[ \t]*name:\s*(.*?)\s*$') { return ([string]$matches[1]).Trim().Trim("'").Trim('"') }
+  }
+  return $null
+}
+
+# 探测 legacy 需要改的 patch 文件状态（只读，供计划与后面的写入使用）。
+# 只看到 "- id: imgpost" **不算**已安装：还要核对这一项的 name 是否指向我们预期的入口。
+# 指向别处（例如 missing.js）时必须视为"需要修正"，否则脚本会跳过写入、最后只校验预期
+# 路径存在，patch 里那条错误路径永远不会被发现。
 function Get-LegacyState([string]$patchDir) {
+  $relEntry = '../../plugins/' + $pluginName + '/' + ($entryRel -replace '\\', '/')
   $patchFile = Join-Path $patchDir 'cordis.patch.yml'
   $exists = Test-Path -LiteralPath $patchFile
   $content = ''
@@ -256,13 +310,54 @@ function Get-LegacyState([string]$patchDir) {
     # 空文件时 Get-Content -Raw 返回 $null，后面要调 .TrimEnd()，这里先归一成空串
     if ($null -eq $content) { $content = '' }
   }
-  $registered = ($content -match '(?m)^\s*-\s*id:\s*imgpost\s*$')
-  return [pscustomobject]@{ File = $patchFile; Exists = $exists; Content = $content; Registered = $registered }
+  $lines = $content -split "\n"
+  $entry = Find-LegacyEntry $lines
+  $found = ($entry.Index -ge 0)
+  $foundName = $null
+  if ($found) { $foundName = Get-LegacyEntryName $lines $entry.Index $entry.Indent }
+  $nameOk = $false
+  if ($found -and $foundName) {
+    $nameOk = Test-SamePath (Join-Path $patchDir $foundName) (Join-Path $patchDir $relEntry)
+  }
+  return [pscustomobject]@{
+    File         = $patchFile
+    Exists       = $exists
+    Content      = $content
+    Registered   = ($found -and $nameOk)
+    NeedsFix     = ($found -and (-not $nameOk))
+    FoundName    = $foundName
+    ExpectedName = $relEntry
+  }
+}
+
+# 把既有的 imgpost 条目里的 name 改成预期入口，其它内容与注释原样保留。
+# 找不到条目返回 $null（调用方据此判定"修正失败"，不要静默当成成功）。
+function Set-LegacyEntryName([string]$content, [string]$relEntry) {
+  $lines = New-Object System.Collections.ArrayList
+  foreach ($l in ($content -split "\n")) { [void]$lines.Add($l) }
+  $entry = Find-LegacyEntry ($lines.ToArray())
+  if ($entry.Index -lt 0) { return $null }
+  $replaceAt = -1
+  $indent = ' ' * ($entry.Indent + 2)
+  for ($j = $entry.Index + 1; $j -lt $lines.Count; $j++) {
+    $line = $lines[$j]
+    if ($line.Trim() -eq '') { continue }
+    if ($line -match '^([ \t]*)-\s') { if ($matches[1].Length -le $entry.Indent) { break } else { continue } }
+    if ($line -match '^[ \t]*#') { continue }
+    if ($line -match '^([ \t]*)name:\s*') { $indent = $matches[1]; $replaceAt = $j; break }
+  }
+  if ($replaceAt -ge 0) {
+    $lines[$replaceAt] = $indent + "name: '" + $relEntry + "'"
+  } else {
+    $lines.Insert($entry.Index + 1, $indent + "name: '" + $relEntry + "'")
+  }
+  return ($lines -join "`n")
 }
 
 # 写入 legacy 的 cordis.patch.yml。调用方已完成确认、备份与插件落地；这里只管写 + 校验，
 # 失败即回滚并退出（不再提前 exit，否则插件根本没被复制就已经"安装成功"了）。
-function Write-LegacyPatch([string]$patchDir, [string]$oldContent) {
+# $needsFix = 已有 imgpost 条目但 name 指向别处：只改那一行，保留其它条目与注释。
+function Write-LegacyPatch([string]$patchDir, [string]$oldContent, [bool]$needsFix) {
   $patchFile = Join-Path $patchDir 'cordis.patch.yml'
   $relEntry = '../../plugins/' + $pluginName + '/' + ($entryRel -replace '\\', '/')
   $blockBody = @"
@@ -278,6 +373,13 @@ function Write-LegacyPatch([string]$patchDir, [string]$oldContent) {
   $isEmptyDoc = ($trimmed -eq '') -or ($trimmed -eq '[]') -or ($trimmed -match '^---\s*(\[\])?\s*$')
   if ($isEmptyDoc) {
     $newContent = $blockBody + "`n"
+  } elseif ($needsFix) {
+    $newContent = Set-LegacyEntryName $oldContent $relEntry
+    if ($null -eq $newContent) {
+      # 计划阶段看到过这个条目，这里却找不到：宁可失败回滚，也不要写出一个半对的文件
+      Invoke-Rollback
+      Fail "无法在 cordis.patch.yml 里定位 imgpost 条目的 name 行，未做修改并已回滚。" 1
+    }
   } else {
     $newContent = $oldContent.TrimEnd() + "`n`n" + $blockBody + "`n"
   }
@@ -287,12 +389,22 @@ function Write-LegacyPatch([string]$patchDir, [string]$oldContent) {
     Invoke-Rollback
     Fail ("写入 cordis.patch.yml 失败：" + $_.Exception.Message) 1
   }
-  # 重写过的文档没有"原内容"可比，校验时按空前缀传入
-  $problems = Test-PatchFile $patchFile $(if ($isEmptyDoc) { '' } else { $oldContent }) $relEntry
-  # 注册的入口必须真的存在：配置写好了但插件没落地，是这一轮要堵的主要漏洞
-  $resolvedEntry = Resolve-Full (Join-Path $patchDir $relEntry)
-  if (-not (Test-Path -LiteralPath $resolvedEntry)) {
-    [void]$problems.Add('patch 里注册的入口文件不存在：' + $resolvedEntry)
+  # 重写/修正过的文档没有"原内容可比"的说法，按空前缀传入
+  $prefixForCheck = $(if ($isEmptyDoc -or $needsFix) { '' } else { $oldContent })
+  # 集合通过 $script:PatchProblems 传递（见 Test-PatchFile 注释）：空 ArrayList 走管道会被
+  # 展开成 $null，调用方再 .Add 就抛异常、回滚不会执行 —— 第三轮审计的阻断项就是这个。
+  # 这里再套一层 try/catch：校验过程本身出错也必须先回滚，绝不留"patch 写了、插件没就位"。
+  $problems = New-Object System.Collections.ArrayList
+  try {
+    [void](Test-PatchFile $patchFile $prefixForCheck $relEntry)
+    $problems = $script:PatchProblems
+    # 注册的入口必须真的存在：配置写好了但插件没落地，是这一轮要堵的主要漏洞
+    $resolvedEntry = Resolve-Full (Join-Path $patchDir $relEntry)
+    if (-not (Test-Path -LiteralPath $resolvedEntry)) {
+      [void]$problems.Add('patch 里注册的入口文件不存在：' + $resolvedEntry)
+    }
+  } catch {
+    [void]$problems.Add('校验过程出错：' + $_.Exception.Message)
   }
   if ($problems.Count -gt 0) {
     Invoke-Rollback
@@ -303,11 +415,56 @@ function Write-LegacyPatch([string]$patchDir, [string]$oldContent) {
   Say-Dim "  写入并校验通过（顶层数组 / 缩进 / 注册入口存在）"
 }
 
-# YAML 结构校验：优先用真正的 YAML 解析器，没有就退化为结构检查
+# 没有 YAML 解析器时的**近似**结构校验：只判断"这份文档像不像一个合法的顶层数组"，
+# 不能证明它是合法 YAML。已知局限：不处理流式风格嵌套、锚点/别名、多行标量、转义序列；
+# 引号配平只看单行；缩进只按空白的相对多少判断。有 ConvertFrom-Yaml 时以真解析为准。
+function Test-YamlStructure([string]$text) {
+  $issues = New-Object System.Collections.ArrayList
+  $lines = $text -split "\n"
+  $brackets = 0
+  $braces = 0
+  for ($i = 0; $i -lt $lines.Count; $i++) {
+    $line = $lines[$i]
+    # 引号外的 "#"（前面是空白）才起注释：注释里的括号/引号不参与判定
+    $stripped = ''
+    $inS = $false
+    $inD = $false
+    for ($c = 0; $c -lt $line.Length; $c++) {
+      $ch = $line[$c]
+      if ($ch -eq "'" -and -not $inD) { $inS = -not $inS; $stripped += $ch; continue }
+      if ($ch -eq '"' -and -not $inS) { $inD = -not $inD; $stripped += $ch; continue }
+      if ($ch -eq '#' -and -not $inS -and -not $inD -and $c -gt 0 -and ($line[$c - 1] -eq ' ' -or $line[$c - 1] -eq "`t")) { break }
+      $stripped += $ch
+    }
+    if ($inS -or $inD) { [void]$issues.Add("第 $($i + 1) 行引号未配平") }
+    foreach ($ch in $stripped.ToCharArray()) {
+      if ($ch -eq '[') { $brackets++ }
+      elseif ($ch -eq ']') { $brackets--; if ($brackets -lt 0) { [void]$issues.Add("第 $($i + 1) 行出现多余的 ]"); $brackets = 0 } }
+      elseif ($ch -eq '{') { $braces++ }
+      elseif ($ch -eq '}') { $braces--; if ($braces -lt 0) { [void]$issues.Add("第 $($i + 1) 行出现多余的 }"); $braces = 0 } }
+    }
+    # 顶层（顶格）的非注释非空行必须是数组项，或空数组/文档起始标记
+    if ($line.Trim() -ne '' -and -not $line.TrimStart().StartsWith('#')) {
+      if ($line -eq $line.TrimStart() -and -not $line.StartsWith('- ') -and $line.Trim() -ne '[]' -and $line.Trim() -ne '---') {
+        [void]$issues.Add("第 $($i + 1) 行位于顶层但不是数组项（应以 '- ' 开头）：" + $line.Trim())
+      }
+    }
+  }
+  if ($brackets -ne 0) { [void]$issues.Add("方括号未配平（差 $brackets 个）") }
+  if ($braces -ne 0) { [void]$issues.Add("花括号未配平（差 $braces 个）") }
+  return $issues
+}
+
+# YAML 结构校验：优先用真正的 YAML 解析器，没有就退化到上面的近似结构检查。
+# 问题集合放进 $script:PatchProblems，**不**在管道里返回：PowerShell 会把空集合展开成
+# $null，调用方再 .Add(...) 就抛异常、回滚不会执行（第三轮审计的阻断项）。
+# 返回问题个数（int，管道安全），调用方可以忽略。
 function Test-PatchFile([string]$patchFile, [string]$oldContent, [string]$relEntry) {
-  $problems = New-Object System.Collections.ArrayList
+  $script:PatchProblems = New-Object System.Collections.ArrayList
+  $problems = $script:PatchProblems
   # 同样：空文件要归一成空串，否则 .StartsWith / 正则都会炸
   $text = [string](Get-Content -LiteralPath $patchFile -Raw -Encoding UTF8)
+  if ($null -eq $text) { $text = '' }
 
   # 1) 原有内容必须原样保留（我们只追加）
   $prefix = $oldContent.TrimEnd()
@@ -324,6 +481,14 @@ function Test-PatchFile([string]$patchFile, [string]$oldContent, [string]$relEnt
   if ($text -notmatch '(?m)^ {4}- id: imgpost\s*$') { [void]$problems.Add('缺少正确的 "    - id: imgpost" 行（4 空格缩进）') }
   if ($text -notmatch ('(?m)^ {6}name: ' + [regex]::Escape("'" + $relEntry + "'") + '\s*$')) {
     [void]$problems.Add('缺少正确的 name 行（6 空格缩进且指向 ' + $relEntry + '）')
+  }
+  # 3.5) 近似结构校验（括号/引号配平、顶层条目形态）：没有 YAML 解析器时不再只靠正则
+  foreach ($issue in (Test-YamlStructure $text)) { [void]$problems.Add($issue) }
+  # 3.6) 追加块与原内容之间必须正好是一个空行（只在"往原文档末尾追加"时要求；整份重写/
+  #      修正时 prefix 传空，这条跳过）。注意：不能用 "- insert:" 去找分隔位置 —— 追加块
+  #      的第一行是注释行，子串匹配会落在注释之后，把正确的输出判成缺空行（误报）。
+  if ($prefix.Length -gt 0 -and -not $text.Contains($prefix + "`n`n")) {
+    [void]$problems.Add('原有内容与追加块之间缺少空行分隔')
   }
   # 4) 若有 YAML 解析器，做一次真正的解析
   $yamlCmd = Get-Command ConvertFrom-Yaml -ErrorAction SilentlyContinue
@@ -350,7 +515,7 @@ function Test-PatchFile([string]$patchFile, [string]$oldContent, [string]$relEnt
       [void]$problems.Add('ConvertFrom-Yaml 解析失败：' + $_.Exception.Message)
     }
   }
-  return $problems
+  return $problems.Count
 }
 
 # ── 判定安装模式：profile 里有可用的 dsh 块就走 bundle，否则走 legacy 的 cordis.patch.yml ──
@@ -410,7 +575,11 @@ if ($needCopy) {
 }
 if ($useLegacy) {
   Say-Dim ("  安装方式      : legacy（改 " + $legacy.File + "，不动 profile 的 package.json）")
-  if ($legacy.Registered) { Say-Dim '  cordis.patch.yml   : 已包含 imgpost（不会重复追加）' }
+  if ($legacy.Registered) { Say-Dim '  cordis.patch.yml   : 已包含 imgpost 且入口正确（不会重复追加）' }
+  elseif ($legacy.NeedsFix) {
+    $shown = $(if ($legacy.FoundName) { $legacy.FoundName } else { '（缺少 name 行）' })
+    Say-Dim ("  cordis.patch.yml   : 已有 imgpost 条目但 name 指向 " + $shown + " -> 将改为 " + $legacy.ExpectedName)
+  }
   elseif (-not $legacy.Exists) { Say-Dim '  cordis.patch.yml   : 不存在 -> 将新建' }
   elseif ($legacy.Content.Trim() -eq '[]' -or $legacy.Content.Trim() -eq '') { Say-Dim '  cordis.patch.yml   : 空文档 -> 将整份重写为新数组' }
   else { Say-Dim '  cordis.patch.yml   : 将追加 imgpost 条目（保留原有内容）' }
@@ -527,19 +696,32 @@ if ($needCopy) {
     Invoke-Rollback
     Fail ("复制插件失败：" + $_.Exception.Message) 1
   }
-  if (-not (Test-Path -LiteralPath (Join-Path $targetDir $entryRel))) {
-    Invoke-Rollback
-    Fail ("复制后找不到入口文件 " + (Join-Path $targetDir $entryRel)) 1
+  # 复制后的复核整段都在回滚保护下：Get-CopyDiff 会在枚举/哈希失败时抛异常（文件被锁、
+  # 读取失败这类竞态），原先这段在 try/catch 之外，异常逃逸后会留下一个已被替换、却没通过
+  # 校验的目标目录，而且不会回滚。这里把结果记进变量、出了 try 再回滚退出，避免在 try 里
+  # 调 Fail（exit 在 try 中的行为容易踩坑）。
+  $copyVerifyProblem = $null
+  try {
+    $entryPath = Join-Path $targetDir $entryRel
+    if (-not (Test-Path -LiteralPath $entryPath -ErrorAction Stop)) {
+      $copyVerifyProblem = "复制后找不到入口文件 " + $entryPath
+    } else {
+      $afterCopy = Get-CopyDiff $sourceDir $targetDir
+      $afterAdd = @($afterCopy.Add)
+      $afterDel = @($afterCopy.Del)
+      if (($afterAdd.Count + $afterDel.Count) -gt 0) {
+        Say-Err "复制后校验失败（双向比对要求目标与源完全一致）："
+        $afterAdd | Select-Object -First 8 | ForEach-Object { Say-Dim ("  + " + $_) }
+        $afterDel | Select-Object -First 8 | ForEach-Object { Say-Dim ("  - " + $_ + "（多余，未清掉）") }
+        $copyVerifyProblem = "复制后双向逐文件校验不通过"
+      }
+    }
+  } catch {
+    $copyVerifyProblem = "复制后校验无法完成（枚举或读取失败）：" + $_.Exception.Message
   }
-  $afterCopy = Get-CopyDiff $sourceDir $targetDir
-  $afterAdd = @($afterCopy.Add)
-  $afterDel = @($afterCopy.Del)
-  if (($afterAdd.Count + $afterDel.Count) -gt 0) {
+  if ($copyVerifyProblem) {
     Invoke-Rollback
-    Say-Err "复制后校验失败（双向比对要求目标与源完全一致）："
-    $afterAdd | Select-Object -First 8 | ForEach-Object { Say-Dim ("  + " + $_) }
-    $afterDel | Select-Object -First 8 | ForEach-Object { Say-Dim ("  - " + $_ + "（多余，未清掉）") }
-    Fail "已回滚。" 1
+    Fail ($copyVerifyProblem + " 已回滚。") 1
   }
   Say-Dim "  复制完成，双向逐文件校验通过"
 }
@@ -594,10 +776,10 @@ if ($configChanged) {
 # ══ 阶段 7：legacy 收尾（写 cordis.patch.yml，不需要 pnpm）═════════════════
 if ($useLegacy) {
   if ($legacy.Registered) {
-    Say-Dim "  cordis.patch.yml 里已有 imgpost 条目，跳过写入。"
+    Say-Dim "  cordis.patch.yml 里已有 imgpost 条目且入口正确，跳过写入。"
   } else {
     Say-Step ("写入 " + $legacy.File + " ...")
-    Write-LegacyPatch $profileDir $legacy.Content
+    Write-LegacyPatch $profileDir $legacy.Content $legacy.NeedsFix
   }
   # 最后再确认一次注册的入口确实存在（插件已经在阶段 6 落地）
   $entryPath = Resolve-Full (Join-Path $profileDir ('../../plugins/' + $pluginName + '/' + ($entryRel -replace '\\', '/')))

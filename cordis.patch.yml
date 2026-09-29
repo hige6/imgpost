@@ -3,11 +3,11 @@
 # send_image / generate_image / imgpost_read_image / imgpost_check_backend
 # 四个工具，以及同源的 /dsh-img2/<sha256> 图片路由。
 #
-# 对外图片基址（例如 Tailscale 域名）不写死在这里，由 profile 的
+# 对外图片基址（例如反向代理域名）不写死在这里，由 profile 的
 # cordis.patch.yml 覆盖：
 #   - id: imgpost
 #     config:
-#       publicBaseUrl: 'https://<your-tailnet-domain>'
+#       publicBaseUrl: 'https://your-public-domain'
 - insert:
     - id: imgpost
       name: 'imgpost'

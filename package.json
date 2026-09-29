@@ -1,11 +1,13 @@
 {
   "name": "imgpost",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "图邮 (imgpost)：让你的 DSH 能发图、会看图 —— 本地图片、网页图片、AI 生图 + 识图（一只眼睛），一键发进对话里。",
   "type": "module",
   "main": "src/host.js",
   "exports": {
-    ".": "./src/host.js"
+    ".": "./src/host.js",
+    "./client": "./src/client.js",
+    "./package.json": "./package.json"
   },
   "files": [
     "src",
@@ -34,6 +36,12 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "slots"
+      ]
     }
   },
   "repository": {
