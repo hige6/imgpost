@@ -175,6 +175,89 @@ export function apply(ctx, config) {
     return null;
   }
 
+  // ── security: what may leave the machine ──────────────────────────────────
+  // 只有真正的 png/jpeg/webp/gif 字节才允许发往外部视觉服务。判定一律以**魔数**为准：
+  // data URI 里声明的 MIME、文件扩展名、调用方传来的 mediaType 都只是参考，不作数。
+  const MAX_VISION_IMAGE_BYTES = 20 * 1024 * 1024;
+  const MAX_CONFIG_BYTES = 256 * 1024;
+  const MAX_CACHE_ENTRY_BYTES = 1024 * 1024;
+  const MAX_ERROR_DETAIL_CHARS = 300;
+
+  function assertImageUpload(bytes, sourceLabel) {
+    if (!bytes || bytes.length === 0) throw new Error(sourceLabel + ': no bytes to read');
+    if (bytes.length > MAX_VISION_IMAGE_BYTES) {
+      throw new Error(sourceLabel + ': ' + bytes.length + ' bytes exceeds the ' + Math.floor(MAX_VISION_IMAGE_BYTES / (1024 * 1024)) + 'MB limit for a request to an external vision service. Nothing was sent.');
+    }
+    const sniffed = sniffMediaType(bytes);
+    if (!sniffed) {
+      throw new Error(sourceLabel + ': not a readable image (png/jpeg/webp/gif only). Nothing was sent to the vision service.');
+    }
+    return sniffed;
+  }
+
+  const LOOPBACK_HOSTS = ['127.0.0.1', '::1', 'localhost'];
+
+  // 明文 http:// 会把 Authorization 头里的 key 原样送出去，所以只有回环地址允许 http。
+  function assertTransportSafe(baseURL, label) {
+    let parsed;
+    try {
+      parsed = new URL(String(baseURL));
+    } catch (e) {
+      throw new Error(label + ' is not a valid URL: ' + redactSecrets(String(baseURL).slice(0, 120)));
+    }
+    if (parsed.protocol === 'https:') return parsed;
+    if (parsed.protocol !== 'http:') {
+      throw new Error(label + ' must be https:// (or http:// on loopback), got ' + parsed.protocol);
+    }
+    const host = String(parsed.hostname || '').replace(/^\[|\]$/g, '').toLowerCase();
+    if (LOOPBACK_HOSTS.indexOf(host) >= 0) return parsed;
+    throw new Error(label + ' points at plain http://' + host + ', so the API key would travel in cleartext. Use https://, or a loopback address (127.0.0.1 / ::1 / localhost) for a server on this machine.');
+  }
+
+  // 上游响应体可能回显凭据，工具结果又会被送进对话甚至上游模型，所以任何会把响应体
+  // 带进错误的出口都要先过这里：遮蔽已知凭据形状 + 当前配置里真实存在的 key，并截断。
+  function redactSecrets(text) {
+    let out = String(text == null ? '' : text);
+    try {
+      const secrets = [];
+      for (const cfg of [visionConfigCache, configCache]) {
+        if (!cfg) continue;
+        if (cfg.key) secrets.push(String(cfg.key));
+        if (cfg.apiKey) secrets.push(String(cfg.apiKey));
+        for (const b of [cfg.primary, cfg.fallback]) if (b && b.apiKey) secrets.push(String(b.apiKey));
+      }
+      for (const s of secrets) if (s.length >= 6) out = out.split(s).join('***');
+    } catch (e) {
+      // 配置还没就绪时只做形状遮蔽
+    }
+    out = out
+      .replace(/sk-[A-Za-z0-9_\-]{8,}/g, 'sk-***')
+      .replace(/ghp_[A-Za-z0-9]{8,}/g, 'ghp_***')
+      .replace(/github_pat_[A-Za-z0-9_]{8,}/g, 'github_pat_***')
+      .replace(/AIza[A-Za-z0-9_\-]{8,}/g, 'AIza***')
+      .replace(/xox[baprs]-[A-Za-z0-9\-]{8,}/g, 'xox***')
+      .replace(/\b[Bb]earer\s+[A-Za-z0-9._\-]{8,}/g, 'Bearer ***');
+    return out.length > MAX_ERROR_DETAIL_CHARS ? out.slice(0, MAX_ERROR_DETAIL_CHARS) + '...' : out;
+  }
+
+  // 后端身份串：缓存命中要核对它，所以配置一改（换 baseURL/model/format）就自然失效。
+  function backendIdent(backend) {
+    if (!backend) return '';
+    return [backend.baseURL || '', backend.model || '', backend.format || ''].join('|');
+  }
+
+  // fs.readText 的真实签名是 (target, signal)：第三个"最大字节数"参数会被忽略
+  // (dsh-fs-local:825)，所以小文件先 stat 看大小，超限就当它不存在。
+  async function readTextCapped(target, maxBytes, signal) {
+    try {
+      const info = await fs.stat(target, signal);
+      if (info && typeof info.size === 'number' && info.size > maxBytes) return null;
+    } catch (e) {
+      return null;
+    }
+    return await fs.readText(target, signal);
+  }
+
   function baseNameOf(p) {
     const parts = String(p).split(/[\\/]/);
     return parts[parts.length - 1] || 'image';
@@ -233,7 +316,9 @@ export function apply(ctx, config) {
       throw new Error('cannot spawn a PowerShell executable (tried pwsh and Windows PowerShell 5.1)');
     }
     if (result.outcome.exitCode !== 0) {
-      throw new Error('powershell exited ' + result.outcome.exitCode + ': ' + (result.err || result.out).slice(0, 600));
+      // 子进程 stderr 可能带上游响应体（Invoke-RestMethod 会把错误正文原样吐出），
+      // 所以进错误消息前先遮蔽凭据形状与当前配置里的真实 key。
+      throw new Error('powershell exited ' + result.outcome.exitCode + ': ' + redactSecrets((result.err || result.out).slice(0, 600)));
     }
     return result.out;
   }
@@ -269,27 +354,32 @@ export function apply(ctx, config) {
     return import('node:crypto').then(({ createHash }) => createHash('sha256').update(String(text), 'utf8').digest('hex'));
   }
 
-  // 兼容旧数据：默认提示 + 无后端身份时沿用旧的 <sha>.json 命名；其它情况用
-  // <sha>-<promptDigest>.json，并在读取时把旧文件当作回落（只在默认提示下才回落到旧文件）。
-  async function visionCacheKey(sha, prompt, backend) {
-    const ident = backend ? [backend.baseURL || '', backend.model || '', backend.format || ''].join('|') : '';
-    const isDefault = isDefaultVisionPrompt(prompt);
-    if (isDefault && !ident) return { key: sha, legacySha: null };
-    const digest = await sha256OfText(effectiveVisionPrompt(prompt) + '\u0000' + ident);
-    return { key: sha + '-' + digest.slice(0, 16), legacySha: isDefault ? sha : null };
+  // 缓存文件名：默认提问 → <sha>.json；自定义提问 → <sha>-<promptDigest>.json。
+  // 后端身份不进文件名，而是写进记录、命中时核对（见 readVisionCache）。
+  async function visionCacheName(sha, prompt) {
+    if (isDefaultVisionPrompt(prompt)) return sha;
+    const digest = await sha256OfText(effectiveVisionPrompt(prompt));
+    return sha + '-' + digest.slice(0, 16);
   }
 
-  async function readVisionCache(key, legacySha) {
-    const names = key === legacySha || !legacySha ? [key + '.json'] : [key + '.json', legacySha + '.json'];
-    for (const name of names) {
-      try {
-        const target = await fs.resolve(await dshPath('imgpost-vision-cache', name));
-        const raw = await fs.readText(target, undefined, 512 * 1024);
-        const parsed = JSON.parse(raw);
-        if (parsed && typeof parsed.text === 'string' && parsed.text) return parsed;
-      } catch (e) {
-        // miss or unreadable — try the next candidate, then the vision engine
-      }
+  // 只有"同一次提问 + 当前配置里真实存在的后端"写的记录才算命中：
+  // ①记录里的 key 必须与本次期望的文件名一致；
+  // ②记录里的 backend 必须是当前 primary/fallback 之一的身份串。
+  // 旧版本写的记录没有 key/backend 字段，一律视为未命中并重新识图一次，随后按新格式重写
+  // （否则换了后端仍会读到上一个后端留下的答案）。
+  async function readVisionCache(name, acceptableIdents) {
+    try {
+      const target = await fs.resolve(await dshPath('imgpost-vision-cache', name + '.json'));
+      const raw = await readTextCapped(target, MAX_CACHE_ENTRY_BYTES, undefined);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed.text !== 'string' || !parsed.text) return null;
+      if (parsed.key !== name) return null;
+      const ident = typeof parsed.backend === 'string' ? parsed.backend : '';
+      if (!ident || acceptableIdents.indexOf(ident) < 0) return null;
+      return parsed;
+    } catch (e) {
+      // miss or unreadable — fall through to the vision engine
     }
     return null;
   }
@@ -312,11 +402,22 @@ export function apply(ctx, config) {
     return isNegativeCacheFresh(entry);
   }
 
-  async function writeVisionCache(key, text, model, refused) {
+  async function writeVisionCache(name, text, model, refused, ident) {
+    // 落盘内容里没有任何凭据；ident 是 后端身份串（baseURL|model|format），不是 key。
+    const payload = JSON.stringify({ text: text, model: model || '', savedAt: Date.now(), refused: refused === true, key: name, backend: ident || '' });
+    // 优先走宿主的 fs 服务：正文不再出现在命令行里（同机其它进程看不到），也不再经过
+    // 子进程。缓存目录不存在时（首次写入）fs.writeText 会失败，此时才回落到
+    // PowerShell：由它建目录并写入；此后的写入都走快路径。
+    try {
+      const path = await import('node:path');
+      const target = await fs.resolve(path.join(await dshPath('imgpost-vision-cache'), name + '.json'));
+      await fs.writeText(target, payload);
+      return;
+    } catch (e) {
+      // fall through to the PowerShell fallback below
+    }
     try {
       const dir = await dshPath('imgpost-vision-cache');
-      const payload = JSON.stringify({ text: text, model: model || '', savedAt: Date.now(), refused: refused === true, key: key });
-      // write through pwsh: fs.writeText may be denied under workspace-write
       const escaped = payload.replace(/'/g, "''");
       const script = [
         "$ErrorActionPreference='Stop'",
@@ -325,7 +426,7 @@ export function apply(ctx, config) {
         '$p=Join-Path $d $env:CACHE_NAME',
         "[IO.File]::WriteAllText($p, '" + escaped + "', [Text.UTF8Encoding]::new($false))",
       ].join('\n');
-      await runPwsh(script, { CACHE_NAME: key + '.json' }, undefined, await homeCwd());
+      await runPwsh(script, { CACHE_NAME: name + '.json' }, undefined, await homeCwd());
     } catch (e) {
       // cache write is best-effort; never fail the read for it
     }
@@ -342,7 +443,7 @@ export function apply(ctx, config) {
     let vRaw = null;
     try {
       const vp = await fs.resolve(await dshPath('vision-sender.json'));
-      vRaw = await fs.readText(vp, signal, 128 * 1024);
+      vRaw = await readTextCapped(vp, MAX_CONFIG_BYTES, signal);
     } catch (e) {
       vRaw = null;
     }
@@ -383,6 +484,8 @@ export function apply(ctx, config) {
   async function callVisionBackend(backend, bytes, mediaType, prompt, signal) {
     if (!backend || !backend.baseURL || !backend.apiKey) throw new Error('vision backend is not configured');
     if (!backend.model) throw new Error('vision backend has no model configured (set "model" in ~/.dsh/vision-sender.json, or DSH_VISION_API_MODEL)');
+    // 明文的 http:// 会把 x-api-key / Authorization 头原样送出去，只有回环地址例外。
+    assertTransportSafe(backend.baseURL, 'vision backend baseURL');
     const b64 = Buffer.from(bytes).toString('base64');
     const userPrompt = effectiveVisionPrompt(prompt);
     let url;
@@ -509,20 +612,25 @@ export function apply(ctx, config) {
     } catch (e) {
       try { detail = (await resp.text()).slice(0, 240); } catch (e2) { }
     }
-    return detail || ('HTTP ' + resp.status);
+    // 上游响应体可能回显凭据，而这条消息会进工具结果、甚至被包装路径送进上游对话，
+    // 所以统一遮蔽凭据形状与当前配置里的真实 key，并截断长度。
+    return redactSecrets(detail || ('HTTP ' + resp.status));
   }
 
   // Core: describe image BYTES through the vision backend with disk cache.
   // No exec dependency — shared by the read_image tool and the provider wrap.
   async function describeBytes(bytes, mediaType, prompt, signal, refresh) {
-    if (!mediaType || !/^image\//.test(mediaType)) mediaType = 'image/png';
+    // 这一层是所有"发往外部视觉服务"的必经之路：只放行魔数可识别的图片字节，
+    // 声明出来的 mediaType 不作数（传 JSON/凭据进来会在这一句被挡下）。
+    mediaType = assertImageUpload(bytes, 'vision input');
     const sha = await sha256OfBytes(bytes);
-    // 缓存键里含后端/模型身份，所以先把后端解析出来（resolveVisionConfig 有内存缓存，
+    // 缓存命中要核对后端身份，所以先把后端解析出来（resolveVisionConfig 有内存缓存，
     // 代价只有首次一次文件读）。
     const cfg = await resolveVisionConfig(signal, await homeCwd(), refresh);
-    const cacheId = await visionCacheKey(sha, prompt, cfg.primary || cfg.fallback);
+    const idents = [backendIdent(cfg.primary), backendIdent(cfg.fallback)].filter(Boolean);
+    const cacheName = await visionCacheName(sha, prompt);
     if (!refresh) {
-      const cached = await readVisionCache(cacheId.key, cacheId.legacySha);
+      const cached = await readVisionCache(cacheName, idents);
       if (isCacheEntryUsable(cached)) {
         // 负缓存（两个后端都因内容策略拒绝了这张图）只在 TTL 内命中：过期后重新尝试，
         // 而不是把一次拒绝永久钉在磁盘上。显式 refresh 永远重试。
@@ -530,15 +638,17 @@ export function apply(ctx, config) {
       }
     }
     let lastError = null;
+    let lastRefusalIdent = null;
     if (cfg.primary) {
       try {
         const text = await callVisionBackend(cfg.primary, bytes, mediaType, prompt, signal);
         // A refusal/policy answer is not a usable description: don't cache it,
         // and treat it as a failure so the fallback backend gets a chance.
         if (!isUsefulVisionText(text)) {
-          throw new Error('vision backend declined: ' + text.slice(0, 120));
+          lastRefusalIdent = backendIdent(cfg.primary);
+          throw new Error('vision backend declined: ' + redactSecrets(text.slice(0, 120)));
         }
-        await writeVisionCache(cacheId.key, text, cfg.primary.model);
+        await writeVisionCache(cacheName, text, cfg.primary.model, false, backendIdent(cfg.primary));
         return { text: text, model: cfg.primary.model, cached: false, sha: sha, mediaType: mediaType, bytes: bytes.length };
       } catch (e) {
         lastError = e;
@@ -548,9 +658,10 @@ export function apply(ctx, config) {
       try {
         const text = await callVisionBackend(cfg.fallback, bytes, mediaType, prompt, signal);
         if (!isUsefulVisionText(text)) {
-          throw new Error('vision backend declined: ' + text.slice(0, 120));
+          lastRefusalIdent = backendIdent(cfg.fallback);
+          throw new Error('vision backend declined: ' + redactSecrets(text.slice(0, 120)));
         }
-        await writeVisionCache(cacheId.key, text, cfg.fallback.model);
+        await writeVisionCache(cacheName, text, cfg.fallback.model, false, backendIdent(cfg.fallback));
         return { text: text, model: cfg.fallback.model, cached: false, sha: sha, mediaType: mediaType, bytes: bytes.length };
       } catch (e) {
         lastError = e;
@@ -564,10 +675,12 @@ export function apply(ctx, config) {
     const lastMsg = String(lastError && lastError.message || lastError);
     if (lastError && /declined|could not be read|refus|declin/i.test(lastMsg)) {
       const declinedText = '[imgpost vision] 该图片因内容安全策略被视觉服务拒绝，暂无法生成描述。可尝试用 refresh 重新请求，或换一个视觉后端。';
-      await writeVisionCache(cacheId.key, declinedText, (cfg.fallback && cfg.fallback.model) || (cfg.primary && cfg.primary.model) || '', true);
+      // 负缓存也要带后端身份：换掉后端之后这次拒绝不再无条件生效。
+      const negIdent = lastRefusalIdent || backendIdent(cfg.fallback) || backendIdent(cfg.primary);
+      await writeVisionCache(cacheName, declinedText, (cfg.fallback && cfg.fallback.model) || (cfg.primary && cfg.primary.model) || '', true, negIdent);
       return { text: declinedText, model: (cfg.fallback && cfg.fallback.model) || '', cached: false, refused: true, sha: sha, mediaType: mediaType, bytes: bytes.length };
     }
-    throw new Error('read_image failed' + (lastError ? ': ' + lastMsg : ' (no vision backend configured; set ~/.dsh/vision-sender.json or DSH_VISION_API_KEY / DSH_VISION_API_BASE / DSH_VISION_API_MODEL)'));
+    throw new Error('read_image failed' + (lastError ? ': ' + redactSecrets(lastMsg) : ' (no vision backend configured; set ~/.dsh/vision-sender.json or DSH_VISION_API_KEY / DSH_VISION_API_BASE / DSH_VISION_API_MODEL)'));
   }
 
   // Heuristic: is this returned text an actual description, or a refusal /
@@ -589,17 +702,19 @@ export function apply(ctx, config) {
   async function readImageWithVision(exec, src, prompt, refresh) {
     const cwd = cwdFor(exec);
     let bytes;
-    let mediaType = 'image/png';
+    let mediaType;
     if (/^sha256:/i.test(src) || /^[a-f0-9]{64}$/i.test(src)) {
       const hex = String(src).replace(/^sha256:/i, '').toLowerCase();
       const target = await fs.resolve(await dshPath('attachments', 'v1', 'objects', hex.slice(0, 2), hex));
       bytes = await fs.readBytes(target, exec.signal, 40 * 1024 * 1024);
-      mediaType = sniffMediaType(bytes) || 'image/png';
+      mediaType = assertImageUpload(bytes, 'attachment sha256:' + hex.slice(0, 12));
     } else if (/^data:/i.test(src)) {
       const m = /^data:([^;,]+)?(;base64)?,(.*)$/s.exec(src);
       if (!m || !m[2]) throw new Error('image data URI must be base64-encoded (data:image/png;base64,...)');
       bytes = Buffer.from(m[3], 'base64');
-      mediaType = sniffMediaType(bytes) || m[1] || 'image/png';
+      // data URI 里声明的 MIME（m[1]）只是参考：实际格式以魔数为准，识别不出就拒绝，
+      // 否则一个 data:application/json;base64,... 也会被原样传去外部视觉服务。
+      mediaType = assertImageUpload(bytes, 'image data URI');
     } else if (/^https?:\/\//i.test(src)) {
       const tmp = await fetchImageToFile(src, exec.signal, cwd);
       try {
@@ -609,11 +724,11 @@ export function apply(ctx, config) {
         // 立刻失败，文件就永远留在 %TEMP% 里了。
         await deleteTempFile(tmp, undefined, cwd);
       }
-      mediaType = sniffMediaType(bytes) || 'image/png';
+      mediaType = assertImageUpload(bytes, 'downloaded file from ' + String(src).slice(0, 80));
     } else {
       const target = await fs.resolve(src, { cwd: cwd });
       bytes = await fs.readBytes(target, exec.signal, 40 * 1024 * 1024);
-      mediaType = sniffMediaType(bytes) || 'image/png';
+      mediaType = assertImageUpload(bytes, 'file ' + String(src).slice(0, 120));
     }
     const result = await describeBytes(bytes, mediaType, prompt, exec.signal, refresh);
     return result;
@@ -648,11 +763,12 @@ export function apply(ctx, config) {
             const hex = String(attachmentId).replace(/^sha256:/i, '').toLowerCase();
             const target = await fs.resolve(await dshPath('attachments', 'v1', 'objects', hex.slice(0, 2), hex));
             const bytes = await fs.readBytes(target, signal, 40 * 1024 * 1024);
-            const mediaType = sniffMediaType(bytes) || 'image/png';
+            const mediaType = assertImageUpload(bytes, 'pasted attachment sha256:' + hex.slice(0, 12));
             const result = await describeBytes(bytes, mediaType, undefined, signal, false);
             out.push({ type: 'text', text: '[Pasted image, described by imgpost vision]\n' + result.text });
           } catch (e) {
-            out.push({ type: 'text', text: '[A pasted image could not be read by imgpost vision: ' + String(e && e.message || e).slice(0, 300) + ']' });
+            // 这条文本会随对话送进上游模型，所以凭据形状必须遮蔽。
+            out.push({ type: 'text', text: '[A pasted image could not be read by imgpost vision: ' + redactSecrets(String(e && e.message || e).slice(0, 300)) + ']' });
           }
         } else {
           out.push({ type: 'text', text: '[A pasted image had no readable attachment reference]' });
@@ -699,8 +815,8 @@ export function apply(ctx, config) {
     const list = new Set();
     try {
       const target = await fs.resolve(await dshPath('vision-sender.json'));
-      const raw = await fs.readText(target, signal, 128 * 1024);
-      const parsed = JSON.parse(raw);
+      const raw = await readTextCapped(target, MAX_CONFIG_BYTES, signal);
+      const parsed = raw ? JSON.parse(raw) : null;
       if (parsed && Array.isArray(parsed.noWrap)) {
         for (const s of parsed.noWrap) if (String(s).trim()) list.add(String(s).trim());
       }
@@ -709,6 +825,18 @@ export function apply(ctx, config) {
     }
     noWrapCache = list;
     return list;
+  }
+
+  // 两份模型元数据是否属于同一"代际"：只比对会影响 token 预算与准入的字段。
+  function sameModelGeneration(a, b) {
+    if (!a || !b) return true;
+    const pick = (m) => [
+      m.id || '',
+      String(m.contextWindow == null ? '' : m.contextWindow),
+      String(m.maxTokens == null ? '' : m.maxTokens),
+      Array.isArray(m.inputModalities) ? m.inputModalities.join(',') : '',
+    ].join('|');
+    return pick(a) === pick(b);
   }
 
   // Register an imgpost-<upstream> adapter that wraps one provider whose
@@ -746,7 +874,7 @@ export function apply(ctx, config) {
           const info = await llm.resolveModelInfo(upstream, model, signal);
           return { ...info, provider: providerId, inputModalities: ['text', 'image'] };
         },
-        stream(options) {
+        stream(options, preparedMeta) {
           const self = this;
           return (async function* () {
             // Per-model pass-through: when the requested model's catalog entry
@@ -754,13 +882,21 @@ export function apply(ctx, config) {
             // the upstream — forward them untouched. For every other model the
             // gate would reject raw images, so rewrite them into evidence text.
             let native = false;
+            let atDispatch = null;
             const modelId = options && options.model;
             if (modelId) {
               try {
-                native = modelIsNativeVision(await llm.resolveModelInfo(upstream, modelId, options.signal));
+                atDispatch = await llm.resolveModelInfo(upstream, modelId, options.signal);
+                native = modelIsNativeVision(atDispatch);
               } catch (e) {
                 native = false; // unknown to the catalog — bridge it
               }
+            }
+            // prepareCall 时算出的 token 预算用的是那一刻的上游元数据，而请求是由 dispatch
+            // 这一刻按 provider id 重新解析出的上游适配器发出的；上游同 id 换配置时两者属于
+            // 不同代际。对不上就记一条告警（可观测），行为不变。
+            if (preparedMeta && atDispatch && !sameModelGeneration(preparedMeta, atDispatch)) {
+              ctx.logger?.warn('[imgpost] imgpost-' + upstream + ' adapter generation changed between prepareCall and dispatch for model "' + String(modelId) + '": the token budget came from prepare-time metadata while the request goes through the dispatch-time adapter.');
             }
             const messages = native ? options.messages : await convertMessagesImages(options.messages, options.signal);
             try {
@@ -780,16 +916,16 @@ export function apply(ctx, config) {
         // undefined, so DSH throws "prepareCall is not a function" on any
         // imgpost-<id> route (e.g. imgpost-qwen).
         //
-        // 已知限制（故意不重构）：这里把"配置代际"绑到了调用对象上（model + stream），
-        // 但 stream 内部是 `yield* llm.stream({ provider: upstream })`，dispatch 那一刻
-        // 会按 provider id 重新解析上游适配器。所以上游 provider 被换掉（同 id 换配置）
-        // 时，已经 prepare 出来的调用对象会在下一次 dispatch 用上新配置，而不是冻结在
-        // prepare 时的代际。对本插件无害（包装只是转写图片块，不缓存上游能力），
-        // 故保留现状：改成逐代绑定需要复刻上游适配器的 prepareCall 语义，得不偿失。
+        // 真实语义（不是"无害"）：token 预算与准入按 **prepare 时** 的上游元数据算，
+        // 请求却由 **dispatch 时** 按 provider id 重新解析出的上游适配器发出；上游同 id
+        // 换配置时两者属于不同代际。这里留一份元数据副本，派发时对不上就记一条可观测
+        // 告警（见 stream），行为不变：改成冻结上游需要复刻上游适配器的 prepareCall
+        // 语义，并绕过宿主 llm.stream 的 waterfall 与图片投影，风险更大。
         async prepareCall(_provider, model, signal) {
+          const preparedMeta = await this.resolveModel(_provider, model, signal);
           return {
-            model: await this.resolveModel(_provider, model, signal),
-            stream: (options) => this.stream(options),
+            model: preparedMeta,
+            stream: (options) => this.stream(options, preparedMeta),
           };
         },
       });
@@ -813,8 +949,8 @@ export function apply(ctx, config) {
     let list = null;
     try {
       const target = await fs.resolve(await dshPath('vision-sender.json'));
-      const raw = await fs.readText(target, undefined, 128 * 1024);
-      const parsed = JSON.parse(raw);
+      const raw = await readTextCapped(target, MAX_CONFIG_BYTES, undefined);
+      const parsed = raw ? JSON.parse(raw) : null;
       if (Array.isArray(parsed && parsed.upstreams) && parsed.upstreams.length > 0) {
         list = parsed.upstreams.map((s) => String(s).trim()).filter(Boolean);
       }
@@ -902,11 +1038,15 @@ export function apply(ctx, config) {
       //    already wrapped that has become fully vision is unwrapped.
       for (const info of providers) {
         const id = info && info.id;
-        if (!id || wrapped.has(id) || foreign.has(id) || excluded.has(id) || isOwnedByAnotherBridge(id)) continue;
+        if (!id || isOwnedByAnotherBridge(id)) continue;
+        // 先读目录：判断"是否已全原生视觉"需要它，而"解除包装"必须发生在
+        // wrapped.has(id) 跳过之前，否则那条分支永远到不了。
+        let catalogRead = false;
         let allVision = false;
         try {
           const models = await llm.listModels(id);
           if (Array.isArray(models) && models.length > 0) {
+            catalogRead = true;
             allVision = true;
             for (const m of models) {
               if (!modelIsNativeVision(m)) { allVision = false; break; }
@@ -916,13 +1056,17 @@ export function apply(ctx, config) {
           // catalog unreadable right now — keep any existing wrap; new ones
           // get wrapped below and a later sweep can revisit
         }
-        if (allVision) {
+        if (catalogRead && allVision) {
+          // 该 provider 的模型已经全部原生视觉：证据桥不再需要，已有的包装撤掉。
+          // 语义没变：别人持有的路由（foreign）本来就不在 wrapped 里，用户 noWrap 的
+          // 条目在第 1 步就撤掉了，这里只管"我们自己的、但已经不必要"的包装。
           if (wrapped.has(id)) {
             dropWrap(id);
             ctx.logger?.info('[imgpost] unwrapped imgpost-' + id + ': all models now accept image input natively');
           }
           continue;
         }
+        if (wrapped.has(id) || foreign.has(id) || excluded.has(id)) continue;
         await ensureWrap(id, (info && info.name) || id);
       }
 
@@ -956,15 +1100,22 @@ export function apply(ctx, config) {
   }
 
   async function fetchImageToFile(url, signal, cwd) {
+    // $p 在任何可能失败的步骤之前就算好，脚本内部用 try/finally 保证失败时不留残留文件：
+    // 外层 finally 只有在脚本把路径回吐到 stdout 之后才拿得到它。
     const script = [
       '[Console]::OutputEncoding=[System.Text.Encoding]::UTF8',
       '[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12',
       "$ErrorActionPreference='Stop'",
       '$p=Join-Path $env:TEMP $env:IMG_FILENAME',
-      '& curl.exe -sL -f --max-time 120 -o $p $env:IMG_URL',
-      'if ($LASTEXITCODE -ne 0) { throw "curl download failed with exit $LASTEXITCODE" }',
-      'if (-not (Test-Path $p)) { throw "curl produced no output file" }',
-      '[Console]::Out.Write($p)',
+      'try {',
+      '  & curl.exe -sL -f --max-time 120 -o $p $env:IMG_URL',
+      '  if ($LASTEXITCODE -ne 0) { throw "curl download failed with exit $LASTEXITCODE" }',
+      '  if (-not (Test-Path $p)) { throw "curl produced no output file" }',
+      '  [Console]::Out.Write($p)',
+      '} catch {',
+      '  Remove-Item -Force -LiteralPath $p -ErrorAction SilentlyContinue',
+      '  throw',
+      '}',
     ].join('\n');
     const out = await runPwsh(script, { IMG_URL: url, IMG_FILENAME: newTempName() }, signal, cwd);
     const path = out.trim();
@@ -976,10 +1127,15 @@ export function apply(ctx, config) {
     const script = [
       '[Console]::OutputEncoding=[System.Text.Encoding]::UTF8',
       "$ErrorActionPreference='Stop'",
-      '$b=[Convert]::FromBase64String($env:IMG_B64)',
       '$p=Join-Path $env:TEMP $env:IMG_FILENAME',
-      '[IO.File]::WriteAllBytes($p, $b)',
-      '[Console]::Out.Write($p)',
+      'try {',
+      '  $b=[Convert]::FromBase64String($env:IMG_B64)',
+      '  [IO.File]::WriteAllBytes($p, $b)',
+      '  [Console]::Out.Write($p)',
+      '} catch {',
+      '  Remove-Item -Force -LiteralPath $p -ErrorAction SilentlyContinue',
+      '  throw',
+      '}',
     ].join('\n');
     const out = await runPwsh(script, { IMG_B64: b64, IMG_FILENAME: newTempName() }, signal, cwd);
     const path = out.trim();
@@ -988,27 +1144,33 @@ export function apply(ctx, config) {
   }
 
   async function generateImageToFile(cfg, prompt, size, model, signal, cwd) {
+    // 明文 http:// 会把 Authorization: Bearer <key> 原样送出去，只有回环地址例外。
+    assertTransportSafe(cfg.base, 'image-generation baseURL');
     const script = [
       '[Console]::OutputEncoding=[System.Text.Encoding]::UTF8',
       '[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12',
       "$ErrorActionPreference='Stop'",
-      "$payload=@{model=$env:IMG_MODEL;prompt=$env:IMG_PROMPT;n=1;size=$env:IMG_SIZE} | ConvertTo-Json -Compress",
-      "$resp=Invoke-RestMethod -Method Post -Uri \"$($env:IMG_BASE)/images/generations\" -Headers @{Authorization=\"Bearer $($env:IMG_KEY)\"} -ContentType 'application/json; charset=utf-8' -Body $payload -TimeoutSec 300",
-      '$item=$resp.data[0]',
-      'if (-not $item) { $item=$resp.images[0] }',
-      '$b64=$item.b64_json',
-      'if (-not $b64) {',
-      '  $u=$item.url',
-      '  $p=Join-Path $env:TEMP $env:IMG_FILENAME',
-      '  & curl.exe -sL -f --max-time 120 -o $p $u',
-      '  if ($LASTEXITCODE -ne 0) { throw "image URL download failed with exit $LASTEXITCODE" }',
-      '  $b64=[Convert]::ToBase64String([IO.File]::ReadAllBytes($p))',
-      '}',
-      "if (-not $b64) { throw 'image API returned no image data' }",
-      '$b=[Convert]::FromBase64String($b64)',
       '$p=Join-Path $env:TEMP $env:IMG_FILENAME',
-      '[IO.File]::WriteAllBytes($p, $b)',
-      '[Console]::Out.Write($p)',
+      'try {',
+      "  $payload=@{model=$env:IMG_MODEL;prompt=$env:IMG_PROMPT;n=1;size=$env:IMG_SIZE} | ConvertTo-Json -Compress",
+      "  $resp=Invoke-RestMethod -Method Post -Uri \"$($env:IMG_BASE)/images/generations\" -Headers @{Authorization=\"Bearer $($env:IMG_KEY)\"} -ContentType 'application/json; charset=utf-8' -Body $payload -TimeoutSec 300",
+      '  $item=$resp.data[0]',
+      '  if (-not $item) { $item=$resp.images[0] }',
+      '  $b64=$item.b64_json',
+      '  if (-not $b64) {',
+      '    $u=$item.url',
+      '    & curl.exe -sL -f --max-time 120 -o $p $u',
+      '    if ($LASTEXITCODE -ne 0) { throw "image URL download failed with exit $LASTEXITCODE" }',
+      '    $b64=[Convert]::ToBase64String([IO.File]::ReadAllBytes($p))',
+      '  }',
+      "  if (-not $b64) { throw 'image API returned no image data' }",
+      '  $b=[Convert]::FromBase64String($b64)',
+      '  [IO.File]::WriteAllBytes($p, $b)',
+      '  [Console]::Out.Write($p)',
+      '} catch {',
+      '  Remove-Item -Force -LiteralPath $p -ErrorAction SilentlyContinue',
+      '  throw',
+      '}',
     ].join('\n');
     const out = await runPwsh(script, {
       IMG_KEY: cfg.key,
@@ -1053,38 +1215,21 @@ export function apply(ctx, config) {
     let base = String(env.DSH_IMAGE_API_BASE || '').trim() || null;
     let model = String(env.DSH_IMAGE_API_MODEL || '').trim() || null;
     if (!key || !base || !model) {
-      // 缺项再去读配置文件。路径显式传给子进程（显式 env 层会合并且不受剥离影响），
-      // 脚本只输出**一行 JSON**：原来三行 Write-Output 的写法里 `Write-Output $null`
-      // 不产生行，中间缺值会让后面的字段整体前移（缺 key 时会被解析成 hasKey=true）。
-      const cfgPath = await dshPath('image-sender.json');
-      const script = [
-        '[Console]::OutputEncoding=[System.Text.Encoding]::UTF8',
-        "$ErrorActionPreference='SilentlyContinue'",
-        // 子进程环境里的 DSH_* 一定为空（宿主会剥离，而本进程读到的值已在上面的 key/base/model
-        // 里），所以这里只从配置文件补齐缺的那几项。
-        '$key=""; $base=""; $model=""',
-        '$cfgPath=$env:IMGPOST_IMAGE_CONFIG',
-        'if ($cfgPath -and (Test-Path $cfgPath)) {',
-        '  try {',
-        '    $cfg=Get-Content -Raw -Path $cfgPath | ConvertFrom-Json',
-        '    $key=$cfg.apiKey; $base=$cfg.baseURL; $model=$cfg.model',
-        '  } catch {}',
-        '}',
-        '$json=@{ key=[string]$key; base=[string]$base; model=[string]$model } | ConvertTo-Json -Compress',
-        '[Console]::Out.Write($json)',
-      ].join('\n');
-      // 只把配置文件路径传进去。**不再**把 DSH_IMAGE_* 转发给子进程：本进程已经读到了
-      // 就够用了（本进程读不到的，子进程同样读不到），而把 apiKey 复制进一个子进程的
-      // 环境里只是多余的凭据外溢。
-      const out = await runPwsh(script, { IMGPOST_IMAGE_CONFIG: cfgPath }, signal, cwd);
+      // 缺项就读配置文件，而且**在本进程读**：既不再起 PowerShell，key 也就不必经过
+      // stdout/命令行/子进程边界。宿主 fs 服务读 ~/.dsh 下的文件是允许的（vision-sender
+      // .json 一直就是这么读的）。文件不存在/超大/解析失败都静默跳过，由调用方按
+      // "缺哪一项"报错，不在这里吞掉真正的原因。
       try {
-        const parsed = JSON.parse(out.trim());
-        if (!key && parsed && typeof parsed.key === 'string' && parsed.key.trim()) key = parsed.key.trim();
-        if (!base && parsed && typeof parsed.base === 'string' && parsed.base.trim()) base = parsed.base.trim();
-        if (!model && parsed && typeof parsed.model === 'string' && parsed.model.trim()) model = parsed.model.trim();
+        const target = await fs.resolve(await dshPath('image-sender.json'));
+        const raw = await readTextCapped(target, MAX_CONFIG_BYTES, signal);
+        const parsed = raw ? JSON.parse(raw) : null;
+        if (parsed && typeof parsed === 'object') {
+          if (!key && typeof parsed.apiKey === 'string' && parsed.apiKey.trim()) key = parsed.apiKey.trim();
+          if (!base && typeof parsed.baseURL === 'string' && parsed.baseURL.trim()) base = parsed.baseURL.trim();
+          if (!model && typeof parsed.model === 'string' && parsed.model.trim()) model = parsed.model.trim();
+        }
       } catch (e) {
-        // 子进程没吐出 JSON（例如 PowerShell 完全起不来时是空输出）：保留已解析到的
-        // 部分，由调用方按"缺哪一项"报错，别在这里吞掉真正的原因。
+        // no file / unreadable / malformed — the caller reports which piece is missing
       }
     }
     const cfg = { key: key, base: base, model: model };
@@ -1276,7 +1421,7 @@ export function apply(ctx, config) {
 
   const readImageTool = {
     name: 'imgpost_read_image',
-    description: 'Read an image through an external vision API and return a detailed text description (OCR / layout / scene / any specific question). Unlike the host read_image tool, this works with ANY model — it does not require the model to declare image input, because the vision call happens outside the model. Accepts a local file path, an http(s) URL, a base64 data URI, or a sha256: attachment id. Uses the configured vision backend (primary ~/.dsh/vision-sender.json, fallback supported, or env DSH_VISION_*) and caches the result on disk keyed by the image digest, so the same image is only ever described once — even across restarts. Use whenever you need to know what is in an image.',
+    description: 'Read an image through an external vision API and return a detailed text description (OCR / layout / scene / any specific question). Unlike the host read_image tool, this works with ANY model — it does not require the model to declare image input, because the vision call happens outside the model. Accepts a local file path, an http(s) URL, a base64 data URI, or a sha256: attachment id; the bytes must be a real png/jpeg/webp/gif (checked by magic number, 20MB limit), and anything else is refused before a request is made. NOTE: the image bytes are uploaded to whichever vision service the user configured in ~/.dsh/vision-sender.json (or env DSH_VISION_*), so only point it at a backend you are willing to send those pictures to. Results are cached on disk keyed by image + question + backend, so the same question about the same image is only sent once — even across restarts. Use whenever you need to know what is in an image.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -1402,7 +1547,7 @@ export function apply(ctx, config) {
             const pathname = String(req.url || '').split('?')[0];
             const hex = pathname.replace(/^\/dsh-img2\//, '');
             if (!/^[a-f0-9]{64}$/i.test(hex)) {
-              res.writeHead(400);
+              res.writeHead(400, { 'X-Content-Type-Options': 'nosniff' });
               res.end('bad attachment id');
               return;
             }
@@ -1410,15 +1555,21 @@ export function apply(ctx, config) {
             const target = await fs.resolve(filePath);
             const bytes = await fs.readBytes(target, undefined, 40 * 1024 * 1024);
             const mediaType = sniffMediaType(bytes) || 'image/png';
+            // 这条路由是 capability URL：URL 里的 64 位 sha 本身就是凭证，宿主没有给插件
+            // 可用的会话鉴权接口，所以这里能做的只有两件事 —— ① 不让中间缓存/代理把图存
+            // 下来转发给别人（private）② 声明 nosniff，别让响应被当别的类型解析。
+            // 谁能拿到这个 URL 谁就能取图；想缩小可达范围请在网络层做（只监听回环、用
+            // Tailscale ACL 限制 tailnet 成员等）。README 的「已知限制」里写明了这一点。
             res.writeHead(200, {
               'Content-Type': mediaType,
               'Content-Length': bytes.byteLength,
-              'Cache-Control': 'public, max-age=31536000, immutable',
+              'Cache-Control': 'private, max-age=31536000, immutable',
+              'X-Content-Type-Options': 'nosniff',
             });
             res.end(bytes);
           } catch (e) {
             try {
-              res.writeHead(404);
+              res.writeHead(404, { 'X-Content-Type-Options': 'nosniff' });
               res.end('image not found');
             } catch (e2) {
               // response already started

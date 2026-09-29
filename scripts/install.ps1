@@ -27,6 +27,7 @@ imgpost（图邮）一键安装脚本 —— Windows / PowerShell
   powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Profile desktop
   powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -FromNpm
   powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -LegacyPatch   # 老版 DSH：改写 cordis.patch.yml
+  powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -DshHome D:\dsh
   powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Yes           # 不交互确认
 
 退出码：
@@ -38,14 +39,27 @@ imgpost（图邮）一键安装脚本 —— Windows / PowerShell
 param(
   [string]$Profile = "",
   [string]$PluginDir = "",
+  [string]$DshHome = "",
   [switch]$FromNpm,
   [switch]$LegacyPatch,
   [switch]$Yes
 )
 
 $ErrorActionPreference = 'Stop'
-$homeDir = if ($env:USERPROFILE) { $env:USERPROFILE } else { $env:HOME }
-$dshRoot = Join-Path $homeDir '.dsh'
+$osHome = if ($env:USERPROFILE) { $env:USERPROFILE } else { $env:HOME }
+# DSH 根目录：优先级必须与插件运行时一致 —— -DshHome > $env:DSH_HOME（trim 后非空）> <os home>/.dsh，
+# 支持 '~' / '~/' / '~\' 前缀展开。插件按 dshHome 配置 > $DSH_HOME > ~/.dsh 解析根目录，
+# 安装器若固定用 USERPROFILE\.dsh，在自定义根目录的机器上会去改错的 profile。
+if ($DshHome -and $DshHome.Trim()) {
+  $dshRootRaw = $DshHome.Trim(); $dshRootSource = '-DshHome'
+} elseif ($env:DSH_HOME -and $env:DSH_HOME.Trim()) {
+  $dshRootRaw = $env:DSH_HOME.Trim(); $dshRootSource = '$env:DSH_HOME'
+} else {
+  $dshRootRaw = Join-Path $osHome '.dsh'; $dshRootSource = '默认 (<os home>/.dsh)'
+}
+if ($dshRootRaw -eq '~') { $dshRootRaw = $osHome }
+elseif ($dshRootRaw.StartsWith('~/') -or $dshRootRaw.StartsWith('~\')) { $dshRootRaw = Join-Path $osHome $dshRootRaw.Substring(2) }
+$dshRoot = [System.IO.Path]::GetFullPath($dshRootRaw)
 $pluginName = 'imgpost'
 $entryRel = 'src/host.js'
 $pluginsRoot = Join-Path $dshRoot 'plugins'
@@ -98,16 +112,39 @@ function Get-FileMap([string]$root) {
     }
   return $map
 }
-# 返回源目录相对目标目录的差异清单（空 = 内容一致，不需要复制）
+# 双向差异：Add = 源有目标缺失/不一致（需要写），Del = 目标有源没有（需要删）。
+# 只比源侧的话，目标目录里旧版残留（比如删掉本地模板后留下的 src\workflows\*.json）
+# 差异数会是 0，永远清理不掉。
 function Get-CopyDiff([string]$source, [string]$target) {
-  $diff = New-Object System.Collections.ArrayList
+  $add = New-Object System.Collections.ArrayList
+  $del = New-Object System.Collections.ArrayList
   $src = Get-FileMap $source
   $tgt = Get-FileMap $target
   foreach ($rel in ($src.Keys | Sort-Object)) {
-    if (-not $tgt.ContainsKey($rel)) { [void]$diff.Add($rel + ' 缺失') ; continue }
-    if ($tgt[$rel] -ne $src[$rel]) { [void]$diff.Add($rel + ' 不一致') }
+    if (-not $tgt.ContainsKey($rel)) { [void]$add.Add($rel + ' 缺失'); continue }
+    if ($tgt[$rel] -ne $src[$rel]) { [void]$add.Add($rel + ' 不一致') }
   }
-  return $diff
+  foreach ($rel in ($tgt.Keys | Sort-Object)) {
+    if (-not $src.ContainsKey($rel)) { [void]$del.Add($rel) }
+  }
+  return [pscustomobject]@{ Add = @($add); Del = @($del) }
+}
+
+# 把源目录整棵树复制到目标（含隐藏文件如 .gitignore，这是 Copy-Item 通配符写法会漏掉的）。
+# 排除规则必须与 Get-FileMap 一致（.git / node_modules / *.bak），否则做完复制的差异校验
+# 会因为被排除的文件而误报。
+function Copy-Tree([string]$Source, [string]$Target) {
+  $src = (Resolve-Full $Source).TrimEnd('\', '/')
+  New-Item -ItemType Directory -Force -Path $Target | Out-Null
+  Get-ChildItem -LiteralPath $src -Recurse -File -Force -ErrorAction SilentlyContinue |
+    Where-Object { $_.FullName -notmatch '\\\.git\\' -and $_.FullName -notmatch '\\node_modules\\' -and $_.Name -notmatch '\.bak' } |
+    ForEach-Object {
+      $rel = $_.FullName.Substring($src.Length).TrimStart('\', '/')
+      $dest = Join-Path $Target $rel
+      $parent = Split-Path -Path $dest -Parent
+      if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
+      Copy-Item -LiteralPath $_.FullName -Destination $dest -Force
+    }
 }
 
 # ── 回滚机制：任何写入前先登记，失败时按相反顺序还原 ────────────────────────
@@ -125,6 +162,13 @@ function Invoke-Rollback {
         if ($a.Backup -and (Test-Path -LiteralPath $a.Backup)) {
           Copy-Item -LiteralPath $a.Backup -Destination $a.Target -Force
           Say-Dim ("  已恢复 " + $a.Target)
+        } elseif (-not $a.Backup) {
+          # 登记时目标原本不存在（例如新建的 cordis.patch.yml）：回滚就是删掉它，
+          # 否则"回滚成功"之后文件还在，等于没回滚。
+          if (Test-Path -LiteralPath $a.Target) {
+            Remove-Item -LiteralPath $a.Target -Force
+            Say-Dim ("  已移除新建的 " + $a.Target)
+          }
         }
       } elseif ($a.Kind -eq 'dir') {
         if (Test-Path -LiteralPath $a.Target) { Remove-Item -LiteralPath $a.Target -Recurse -Force }
@@ -202,56 +246,61 @@ try {
 if ($null -eq $pkg) { Fail ("profile 的 package.json 是空的，已停止（未做任何改动）。") 1 }
 
 # ══ 阶段 3：只读计划 ═══════════════════════════════════════════════════════
-function Invoke-LegacyPatch([string]$patchDir) {
-  # 老版 DSH：往 cordis.patch.yml 末尾追加一个 insert 块（先备份、后写入、再校验）
+# 探测 legacy 需要改的 patch 文件状态（只读，供计划与后面的写入使用）
+function Get-LegacyState([string]$patchDir) {
   $patchFile = Join-Path $patchDir 'cordis.patch.yml'
-  $oldContent = if (Test-Path -LiteralPath $patchFile) { Get-Content -LiteralPath $patchFile -Raw -Encoding UTF8 } else { "" }
-  # 空文件时 Get-Content -Raw 返回 $null，后面要调 .TrimEnd()，这里先归一成空串
-  if ($null -eq $oldContent) { $oldContent = '' }
-  if ($oldContent -match '(?m)^\s*-\s*id:\s*imgpost\s*$') {
-    Say-Warn ("imgpost 已经写在 " + $patchFile + " 里了，无需操作。")
-    exit 0
+  $exists = Test-Path -LiteralPath $patchFile
+  $content = ''
+  if ($exists) {
+    $content = [string](Get-Content -LiteralPath $patchFile -Raw -Encoding UTF8)
+    # 空文件时 Get-Content -Raw 返回 $null，后面要调 .TrimEnd()，这里先归一成空串
+    if ($null -eq $content) { $content = '' }
   }
-  $relEntry = '../../plugins/' + $pluginName + '/' + ($entryRel -replace '\\', '/')
-  $block = @"
+  $registered = ($content -match '(?m)^\s*-\s*id:\s*imgpost\s*$')
+  return [pscustomobject]@{ File = $patchFile; Exists = $exists; Content = $content; Registered = $registered }
+}
 
+# 写入 legacy 的 cordis.patch.yml。调用方已完成确认、备份与插件落地；这里只管写 + 校验，
+# 失败即回滚并退出（不再提前 exit，否则插件根本没被复制就已经"安装成功"了）。
+function Write-LegacyPatch([string]$patchDir, [string]$oldContent) {
+  $patchFile = Join-Path $patchDir 'cordis.patch.yml'
+  $relEntry = '../../plugins/' + $pluginName + '/' + ($entryRel -replace '\\', '/')
+  $blockBody = @"
 # -- imgpost (TuYou): send_image / generate_image / imgpost_read_image / imgpost_check_backend --
 - insert:
     - id: imgpost
       name: '$relEntry'
 "@
-  if (-not $Yes) {
-    Write-Host ""
-    Write-Host ("将向 " + $patchFile + " 末尾追加 imgpost 配置（先备份、失败回滚）。继续？[Y/n] ") -NoNewline -ForegroundColor Yellow
-    $ans = Read-Host
-    if ($ans -notmatch '^[Yy]?$') { Say-Warn "已取消，未做任何改动。"; exit 3 }
+  # 空文档（0 字节）或顶层空数组（[]）：整份重写成新数组。往 "[]" 后面追加 "- insert:"
+  # 会得到"数组后面再跟一个 map"的混合文档，宿主真实的 js-yaml 会直接拒绝。这种文档本来
+  # 就没有可保留的注释，所以选择重写而不是追加。
+  $trimmed = $oldContent.Trim()
+  $isEmptyDoc = ($trimmed -eq '') -or ($trimmed -eq '[]') -or ($trimmed -match '^---\s*(\[\])?\s*$')
+  if ($isEmptyDoc) {
+    $newContent = $blockBody + "`n"
+  } else {
+    $newContent = $oldContent.TrimEnd() + "`n`n" + $blockBody + "`n"
   }
-  # 备份就近存放：cordis.patch.yml.bak-<时间戳>
-  $patchBackup = $patchFile + '.bak-' + $stamp
-  try {
-    if (Test-Path -LiteralPath $patchFile) { Copy-Item -LiteralPath $patchFile -Destination $patchBackup -Force }
-  } catch {
-    Fail ("创建备份失败，未做任何改动：" + $_.Exception.Message) 1
-  }
-  Add-Rollback 'file' $patchFile $patchBackup
-  $newContent = $oldContent.TrimEnd() + "`n" + $block + "`n"
   try {
     [System.IO.File]::WriteAllText($patchFile, $newContent, [System.Text.UTF8Encoding]::new($false))
   } catch {
     Invoke-Rollback
     Fail ("写入 cordis.patch.yml 失败：" + $_.Exception.Message) 1
   }
-  $problems = Test-PatchFile $patchFile $oldContent $relEntry
+  # 重写过的文档没有"原内容"可比，校验时按空前缀传入
+  $problems = Test-PatchFile $patchFile $(if ($isEmptyDoc) { '' } else { $oldContent }) $relEntry
+  # 注册的入口必须真的存在：配置写好了但插件没落地，是这一轮要堵的主要漏洞
+  $resolvedEntry = Resolve-Full (Join-Path $patchDir $relEntry)
+  if (-not (Test-Path -LiteralPath $resolvedEntry)) {
+    [void]$problems.Add('patch 里注册的入口文件不存在：' + $resolvedEntry)
+  }
   if ($problems.Count -gt 0) {
     Invoke-Rollback
     Say-Err "cordis.patch.yml 校验不通过："
     $problems | ForEach-Object { Say-Dim ("  - " + $_) }
-    Fail "已回滚到改动前的内容。" 1
+    Fail "已回滚到改动前的状态。" 1
   }
-  Say-Ok ("imgpost 已写入 " + $patchFile + "（legacy insert 模式）。")
-  Say-Dim ("备份：" + $patchBackup)
-  Say-Warn "下一步：重启 DSH。"
-  exit 0
+  Say-Dim "  写入并校验通过（顶层数组 / 缩进 / 注册入口存在）"
 }
 
 # YAML 结构校验：优先用真正的 YAML 解析器，没有就退化为结构检查
@@ -304,14 +353,15 @@ function Test-PatchFile([string]$patchFile, [string]$oldContent, [string]$relEnt
   return $problems
 }
 
-# ── legacy 模式直接走 ──────────────────────────────────────────────────────
-if ($LegacyPatch) { Invoke-LegacyPatch $profileDir }
-
-# ── 判断 profile 里 dsh 结构是否需要初始化（不再对 null 调 Add-Member）──────
-$hasDsh = $null -ne $pkg.PSObject.Properties['dsh']
-if (-not $hasDsh) {
-  Say-Warn "这个 profile 里没有 dsh 配置块，改用 legacy 的 cordis.patch.yml 方式。"
-  Invoke-LegacyPatch $profileDir
+# ── 判定安装模式：profile 里有可用的 dsh 块就走 bundle，否则走 legacy 的 cordis.patch.yml ──
+# dsh: null 必须当成"没有"：只判属性存在的话，后面的 $pkg.dsh.PSObject / Add-Member
+# 会在 null 上抛错。
+$hasDsh = ($null -ne $pkg.PSObject.Properties['dsh']) -and ($null -ne $pkg.dsh)
+$useLegacy = $LegacyPatch -or (-not $hasDsh)
+if ($LegacyPatch -and $hasDsh) {
+  Say-Dim "指定了 -LegacyPatch：按 legacy 的 cordis.patch.yml 方式安装（不动 profile 的 package.json）。"
+} elseif (-not $hasDsh) {
+  Say-Warn "这个 profile 里没有可用的 dsh 配置块（缺失或为 null），改用 legacy 的 cordis.patch.yml 方式。"
 }
 
 $wantLink = 'link:' + ($targetDir -replace '\\', '/')
@@ -320,46 +370,70 @@ if ($pkg.dependencies -and $pkg.dependencies.PSObject.Properties[$pluginName]) {
   $depValue = [string]$pkg.dependencies.$pluginName
 }
 $depTarget = Get-LinkTarget $depValue $profileDir
-$depOk = Test-SamePath $depTarget $targetDir
+$depOk = (Test-SamePath $depTarget $targetDir)
 
 $bundles = $null
-if ($pkg.dsh.profile -and $pkg.dsh.profile.PSObject.Properties['bundles']) { $bundles = $pkg.dsh.profile.bundles }
+if ((-not $useLegacy) -and $pkg.dsh.profile -and $pkg.dsh.profile.PSObject.Properties['bundles']) { $bundles = $pkg.dsh.profile.bundles }
 $bundleOk = ($null -ne $bundles) -and (@($bundles) -contains $pluginName)
 
 $needCopy = $true
-$copyDiff = @()
+$copyAdd = @()
+$copyDel = @()
 if ($FromNpm) {
-  $copyDiff = @('（npm 模式：确认后下载再复制）')
+  $copyAdd = @('（npm 模式：确认后下载再复制）')
 } elseif ($samePath) {
   $needCopy = $false
 } else {
-  $copyDiff = @(Get-CopyDiff $sourceDir $targetDir)
-  $needCopy = ($copyDiff.Count -gt 0)
+  try {
+    $d = Get-CopyDiff $sourceDir $targetDir
+    $copyAdd = @($d.Add)
+    $copyDel = @($d.Del)
+    $needCopy = (($copyAdd.Count + $copyDel.Count) -gt 0)
+  } catch {
+    # 源目录里有读不了的文件（被独占锁定 / 权限不足）时差异比对会抛错：必须在任何写入
+    # 之前停下并给出明确原因，而不是甩一个原始异常、更不是带着半份差异继续往下走。
+    Fail ("无法读取源目录或目标目录里的文件，改动前已停止（未做任何写入）：" + $_.Exception.Message) 1
+  }
 }
 
 $linked = Test-Path -LiteralPath (Join-Path $profileDir ('node_modules\' + $pluginName))
+$legacy = Get-LegacyState $profileDir
 
 Say-Step "计划："
-Say-Dim ("  插件目录      : " + $targetDir + $(if ($needCopy) { '  -> 将被写入' } else { '  -> 内容已一致，跳过' }))
-if ($needCopy) { $copyDiff | Select-Object -First 8 | ForEach-Object { Say-Dim ("                  · " + $_) } }
-if ($copyDiff.Count -gt 8) { Say-Dim ("                  · ... 共 " + $copyDiff.Count + " 项") }
-$depLine = '  依赖           : '
-if ($depOk) { $depLine += $wantLink + '（已正确）' }
-elseif ($depValue) { $depLine += $depValue + '  -> 将改为 ' + $wantLink }
-else { $depLine += '将新增 ' + $wantLink }
-Say-Dim $depLine
-if ($bundleOk) { Say-Dim '  dsh.profile.bundles: 已包含 imgpost' }
-elseif ($null -eq $bundles) { Say-Dim '  dsh.profile.bundles: 不存在 -> 将创建并加入 imgpost' }
-else { Say-Dim '  dsh.profile.bundles: 将加入 imgpost（保持原有顺序）' }
-if ($linked) { Say-Dim '  node_modules 链接  : 已存在' } else { Say-Dim '  node_modules 链接  : 缺失 -> 需要 pnpm install' }
+Say-Dim ("  DSH 根目录    : " + $dshRoot + "（来源：" + $dshRootSource + "）")
+Say-Dim ("  插件目录      : " + $targetDir + $(if ($needCopy) { '  -> 将按源内容重建' } else { '  -> 内容已一致，跳过' }))
+if ($needCopy) {
+  $copyAdd | Select-Object -First 6 | ForEach-Object { Say-Dim ("                  + " + $_) }
+  if ($copyAdd.Count -gt 6) { Say-Dim ("                  + ... 共 " + $copyAdd.Count + " 项新增/更新") }
+  $copyDel | Select-Object -First 6 | ForEach-Object { Say-Dim ("                  - " + $_ + "（源里已没有，将删除）") }
+  if ($copyDel.Count -gt 6) { Say-Dim ("                  - ... 共 " + $copyDel.Count + " 项将删除") }
+}
+if ($useLegacy) {
+  Say-Dim ("  安装方式      : legacy（改 " + $legacy.File + "，不动 profile 的 package.json）")
+  if ($legacy.Registered) { Say-Dim '  cordis.patch.yml   : 已包含 imgpost（不会重复追加）' }
+  elseif (-not $legacy.Exists) { Say-Dim '  cordis.patch.yml   : 不存在 -> 将新建' }
+  elseif ($legacy.Content.Trim() -eq '[]' -or $legacy.Content.Trim() -eq '') { Say-Dim '  cordis.patch.yml   : 空文档 -> 将整份重写为新数组' }
+  else { Say-Dim '  cordis.patch.yml   : 将追加 imgpost 条目（保留原有内容）' }
+} else {
+  $depLine = '  依赖           : '
+  if ($depOk) { $depLine += $wantLink + '（已正确）' }
+  elseif ($depValue) { $depLine += $depValue + '  -> 将改为 ' + $wantLink }
+  else { $depLine += '将新增 ' + $wantLink }
+  Say-Dim $depLine
+  if ($bundleOk) { Say-Dim '  dsh.profile.bundles: 已包含 imgpost' }
+  elseif ($null -eq $bundles) { Say-Dim '  dsh.profile.bundles: 不存在 -> 将创建并加入 imgpost' }
+  else { Say-Dim '  dsh.profile.bundles: 将加入 imgpost（保持原有顺序）' }
+  if ($linked) { Say-Dim '  node_modules 链接  : 已存在' } else { Say-Dim '  node_modules 链接  : 缺失 -> 需要 pnpm install' }
+}
 
-$configChanged = (-not $depOk) -or (-not $bundleOk)
+$configChanged = ((-not $depOk) -or (-not $bundleOk)) -and (-not $useLegacy)
+$legacyChanged = $useLegacy -and (-not $legacy.Registered)
 
-if ((-not $needCopy) -and (-not $configChanged) -and $linked) {
-  Say-Ok "imgpost 已安装且链接完整，无需操作。"
+if ((-not $needCopy) -and (-not $configChanged) -and (-not $legacyChanged) -and ($linked -or $useLegacy)) {
+  Say-Ok "imgpost 已安装完整，无需操作。"
   exit 0
 }
-if ((-not $needCopy) -and (-not $configChanged) -and (-not $linked)) {
+if ((-not $needCopy) -and (-not $configChanged) -and (-not $useLegacy) -and (-not $linked)) {
   Say-Warn "配置已就绪，但 node_modules 里还没有 imgpost 链接，需要跑一次 pnpm install。"
 }
 
@@ -396,15 +470,34 @@ if ($FromNpm) {
 
 # ══ 阶段 5b：备份（就近存放，便于手工还原）═════════════════════════════════
 Say-Step "备份 ..."
-$profileBackup = $profilePkg + '.bak-' + $stamp
-try {
-  Copy-Item -LiteralPath $profilePkg -Destination $profileBackup -Force
-} catch {
-  Fail ("备份 profile package.json 失败，未做任何改动：" + $_.Exception.Message) 1
+if (-not $useLegacy) {
+  $profileBackup = $profilePkg + '.bak-' + $stamp
+  try {
+    Copy-Item -LiteralPath $profilePkg -Destination $profileBackup -Force
+  } catch {
+    Fail ("备份 profile package.json 失败，未做任何改动：" + $_.Exception.Message) 1
+  }
+  Add-Rollback 'file' $profilePkg $profileBackup
+  [void]$script:BackupsMade.Add($profileBackup)
+  Say-Dim ("  profile 配置 -> " + $profileBackup)
+} elseif (-not $legacy.Registered) {
+  # legacy 模式只动 cordis.patch.yml：存在就备份，不存在就把"新建"登记进回滚
+  # （Backup 为空 = 回滚时删除），否则失败回滚后反而留下一个多出来的 patch 文件。
+  if ($legacy.Exists) {
+    $patchBackup = $legacy.File + '.bak-' + $stamp
+    try {
+      Copy-Item -LiteralPath $legacy.File -Destination $patchBackup -Force
+    } catch {
+      Fail ("备份 cordis.patch.yml 失败，未做任何改动：" + $_.Exception.Message) 1
+    }
+    Add-Rollback 'file' $legacy.File $patchBackup
+    [void]$script:BackupsMade.Add($patchBackup)
+    Say-Dim ("  cordis.patch.yml -> " + $patchBackup)
+  } else {
+    Add-Rollback 'file' $legacy.File $null
+    Say-Dim "  cordis.patch.yml -> 不存在（本次新建，回滚时删除）"
+  }
 }
-Add-Rollback 'file' $profilePkg $profileBackup
-[void]$script:BackupsMade.Add($profileBackup)
-Say-Dim ("  profile 配置 -> " + $profileBackup)
 
 $pluginBackup = $null
 if ($needCopy -and (Test-Path -LiteralPath $targetDir)) {
@@ -424,10 +517,12 @@ if ($needCopy -and -not (Test-Path -LiteralPath $targetDir)) {
 
 # ══ 阶段 6：写入（失败即回滚）═════════════════════════════════════════════
 if ($needCopy) {
-  Say-Step ("复制插件到 " + $targetDir + " ...")
+  Say-Step ("把插件目录按源内容重建：" + $targetDir + " ...")
   try {
-    New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
-    Copy-Item -Path (Join-Path $sourceDir '*') -Destination $targetDir -Recurse -Force
+    # 事务式替换：先清空再复制。只做合并复制的话，目标里旧版残留（例如上一版带的
+    # src\workflows\*.json）差异数为 0，永远清不掉。清空前目录已经整份备份并登记回滚。
+    if (Test-Path -LiteralPath $targetDir) { Remove-Item -LiteralPath $targetDir -Recurse -Force }
+    Copy-Tree -Source $sourceDir -Target $targetDir
   } catch {
     Invoke-Rollback
     Fail ("复制插件失败：" + $_.Exception.Message) 1
@@ -436,14 +531,17 @@ if ($needCopy) {
     Invoke-Rollback
     Fail ("复制后找不到入口文件 " + (Join-Path $targetDir $entryRel)) 1
   }
-  $afterCopy = @(Get-CopyDiff $sourceDir $targetDir)
-  if ($afterCopy.Count -gt 0) {
+  $afterCopy = Get-CopyDiff $sourceDir $targetDir
+  $afterAdd = @($afterCopy.Add)
+  $afterDel = @($afterCopy.Del)
+  if (($afterAdd.Count + $afterDel.Count) -gt 0) {
     Invoke-Rollback
-    Say-Err "复制后校验失败，以下文件与来源不一致："
-    $afterCopy | Select-Object -First 8 | ForEach-Object { Say-Dim ("  - " + $_) }
+    Say-Err "复制后校验失败（双向比对要求目标与源完全一致）："
+    $afterAdd | Select-Object -First 8 | ForEach-Object { Say-Dim ("  + " + $_) }
+    $afterDel | Select-Object -First 8 | ForEach-Object { Say-Dim ("  - " + $_ + "（多余，未清掉）") }
     Fail "已回滚。" 1
   }
-  Say-Dim "  复制完成并逐文件校验通过"
+  Say-Dim "  复制完成，双向逐文件校验通过"
 }
 
 if ($configChanged) {
@@ -493,7 +591,28 @@ if ($configChanged) {
   Say-Dim ("    dsh.profile.bundles += " + $pluginName)
 }
 
-# ══ 阶段 7：pnpm install（检查退出码）═════════════════════════════════════
+# ══ 阶段 7：legacy 收尾（写 cordis.patch.yml，不需要 pnpm）═════════════════
+if ($useLegacy) {
+  if ($legacy.Registered) {
+    Say-Dim "  cordis.patch.yml 里已有 imgpost 条目，跳过写入。"
+  } else {
+    Say-Step ("写入 " + $legacy.File + " ...")
+    Write-LegacyPatch $profileDir $legacy.Content
+  }
+  # 最后再确认一次注册的入口确实存在（插件已经在阶段 6 落地）
+  $entryPath = Resolve-Full (Join-Path $profileDir ('../../plugins/' + $pluginName + '/' + ($entryRel -replace '\\', '/')))
+  if (-not (Test-Path -LiteralPath $entryPath)) {
+    Invoke-Rollback
+    Fail ("安装后校验失败：patch 注册的入口不存在 " + $entryPath) 1
+  }
+  Say-Ok "imgpost 安装成功（legacy insert 模式）。"
+  Say-Dim ("  入口：" + $entryPath)
+  Say-BackupNote
+  Say-Warn "下一步：重启 DSH，模型会拿到 send_image / generate_image / imgpost_read_image / imgpost_check_backend。"
+  exit 0
+}
+
+# ══ 阶段 8：pnpm install（检查退出码）═════════════════════════════════════
 $pnpmCmd = Get-Command pnpm -ErrorAction SilentlyContinue
 if (-not $pnpmCmd) {
   Say-Err "没找到 pnpm，安装尚未完成。请手动执行："
