@@ -1,7 +1,7 @@
 {
   "name": "imgpost",
   "version": "0.3.1",
-  "description": "图邮：在 DeepSeek Harness 对话里发图、生图，让文本模型也能识图。",
+  "description": "图邮：让 DSH 助手把图片直接发到聊天里给你看，也支持生图和识图。",
   "type": "module",
   "main": "src/host.js",
   "exports": {
