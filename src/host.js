@@ -501,16 +501,15 @@ export function apply(ctx, config) {
     return await dshPath('attachments', 'v1', 'objects', sha.slice(0, 2), sha);
   }
 
-  // 有完整 ref 时优先用宿主接口读（任何附件后端都行，且宿主会顺带校验摘要与元数据）；
-  // 拿不到就退回"路径 + 读字节"。
+  // 有完整 ref 时由宿主校验摘要与元数据，失败即停止；只有没有 ref 或旧宿主
+  // 不提供读取接口时才使用路径读取。
   async function readAttachmentBytes(ref, hex, signal) {
     if (ref && attachments && typeof attachments.readImage === 'function') {
-      try {
-        const out = await attachments.readImage(ref, signal);
-        if (out && out.data) return Buffer.from(out.data);
-      } catch (e) {
-        // 交给下面的路径回落
-      }
+      // A failed host read may mean corruption or cancellation. Never bypass
+      // that verdict by reopening the underlying file without verification.
+      const out = await attachments.readImage(ref, signal);
+      if (!out || !out.data) throw new Error('imgpost: host attachment read returned no image data');
+      return Buffer.from(out.data);
     }
     const target = await fs.resolve(await attachmentHostPath(hex));
     return fs.readBytes(target, signal, 40 * 1024 * 1024);
@@ -942,6 +941,14 @@ export function apply(ctx, config) {
         // 路由都会调用的方法（dsh-llm: `this.adapters.get(provider)?.adapter.imageRequestPricing(...)`）；
         // 普通对象字面量没有基类默认实现，漏了就是运行时 TypeError。整条委托给上游。
         imageRequestPricing(_provider, model) { return llm.imageRequestPricing(upstream, model); },
+        // Newer hosts call this directly on adapters (object literals do not
+        // inherit LlmAdapter defaults). Preserve older hosts' default target.
+        imageRequestTarget(_provider, model, image) {
+          if (typeof llm.imageRequestTarget === 'function') {
+            return llm.imageRequestTarget(upstream, model, image);
+          }
+          return { width: image.width, height: image.height, maxBytes: image.bytes };
+        },
         async listModels(_provider, signal) {
           const models = await llm.listModels(upstream, signal);
           return (models || [])
@@ -1007,16 +1014,10 @@ export function apply(ctx, config) {
         // 告警（见 stream），行为不变：改成冻结上游需要复刻上游适配器的 prepareCall
         // 语义，并绕过宿主 llm.stream 的 waterfall 与图片投影，风险更大。
         async prepareCall(_provider, model, signal) {
-          const preparedMeta = await this.resolveModel(_provider, model, signal);
-          // 另存一份**原始上游**元数据用于代际比对：this.resolveModel 返回的是包装后的
-          // 元数据（inputModalities 被改成 ['text','image']、provider 换成本包装），拿它跟
-          // dispatch 时解析出的上游元数据比会永远不相等。
-          let upstreamMeta = null;
-          try {
-            upstreamMeta = await llm.resolveModelInfo(upstream, model, signal);
-          } catch (e) {
-            upstreamMeta = null; // 上游目录读不到时不比对，避免误报
-          }
+          // Derive both views from one lookup: two lookups could already see
+          // different generations before dispatch and double catalog I/O.
+          const upstreamMeta = await llm.resolveModelInfo(upstream, model, signal);
+          const preparedMeta = { ...upstreamMeta, provider: providerId, inputModalities: ['text', 'image'] };
           return {
             model: preparedMeta,
             stream: (options) => this.stream(options, upstreamMeta),
