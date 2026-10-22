@@ -12,6 +12,8 @@
   "files": [
     "src",
     "docs",
+    "assets",
+    "screenshots.json",
     "scripts",
     "cordis.patch.yml",
     "CHANGELOG.md",
