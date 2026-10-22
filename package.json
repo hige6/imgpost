@@ -1,7 +1,7 @@
 {
   "name": "imgpost",
   "version": "0.3.1",
-  "description": "图邮 (imgpost)：让你的 DSH 能发图、会看图 —— 本地图片、网页图片、AI 生图 + 识图（一只眼睛），一键发进对话里。",
+  "description": "图邮：在 DeepSeek Harness 对话里发图、生图，让文本模型也能识图。",
   "type": "module",
   "main": "src/host.js",
   "exports": {
@@ -11,6 +11,7 @@
   },
   "files": [
     "src",
+    "docs",
     "scripts",
     "cordis.patch.yml",
     "CHANGELOG.md",
