@@ -1,0 +1,25 @@
+name: Chat CI smoke test
+on:
+  pull_request:
+    paths:
+      - 'src/**/*.js'
+      - '.github/workflows/chat-ci-smoke-test.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Check JavaScript syntax
+        run: |
+          node --check src/host.js
+          node --check src/client.js
+      - name: Validate package.json
+        run: node -e "JSON.parse(require('node:fs').readFileSync('package.json', 'utf8'))"
